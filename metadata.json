@@ -1,0 +1,6 @@
+{
+  "name": "Estadat Al-Borg Restaurant ERP",
+  "description": "Integrated Restaurant ERP, POS, KDS, Inventory BOM, Double-Entry Accounting & CFO Financial Dashboard for Estadat — Al-Borg El-Menoufia.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
