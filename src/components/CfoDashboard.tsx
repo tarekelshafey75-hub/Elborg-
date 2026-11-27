@@ -10,6 +10,7 @@ import {
   ClipboardCheck,
   Clock,
   Download,
+  FileDown,
   LandPlot,
   OctagonAlert,
   Printer,
@@ -19,17 +20,28 @@ import {
   ShieldCheck,
   ShoppingCart,
   SlidersHorizontal,
+  TrendingDown,
   X,
   Zap,
 } from 'lucide-react';
+import {
+  Area,
+  AreaChart,
+  ReferenceLine,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+} from 'recharts';
 import { ErpState, Language, StrategyRisk } from '../types/erp';
 import {
   computeAccountBalances,
+  computeCfoVatSummary,
   computeFoodCostVarianceAnalysis,
   computeStockOpportunityAlerts,
   computeStocktakeVarianceAlerts,
   round2,
 } from '../utils/erpEngine';
+import { buildMonthlyTrendSeries } from '../utils/executivePdfBuilder';
 import {
   loadSavedRoiInputs,
   ROI_PRESETS,
@@ -50,6 +62,7 @@ interface CfoDashboardProps {
   state: ErpState;
   lang: Language;
   onNavigate: (tab: 'accounting' | 'inventory' | 'pos' | 'strategy' | 'purchases' | 'cfo_review' | 'roi_simulator') => void;
+  onOpenPerformanceReview?: () => void;
   onQuickReorder?: (payload: { ingredientId: string; supplierId: string; qty: number }) => void;
   onNavigateToStocktakeReconcile?: (payload: { stocktakeId?: string; ingredientId?: string }) => void;
   onReconcileStocktake?: (stocktakeId: string) => Promise<void>;
@@ -64,7 +77,7 @@ type CostCenterId = 'CC-HR' | 'CC-KITCHEN' | 'CC-ADMIN' | 'CC-FACILITY' | 'CC-TR
 type CostCenterAlertFilter = 'all' | 'exceeded' | 'approaching' | 'safe';
 type FoodCostFilter = 'all' | 'exceeded' | 'within';
 type StocktakeFilter = 'all' | 'exceeded' | 'within' | 'reconciled';
-type VatViewMode = 'chart' | 'schedule' | 'sources';
+type VatViewMode = 'chart' | 'schedule' | 'audit' | 'sources';
 
 interface FoodCostNotification {
   id: string;
@@ -102,9 +115,29 @@ interface StocktakeVarianceNotification {
   acknowledged: boolean;
 }
 
+interface RevenueGrowthAlertNotification {
+  id: string;
+  signature: string;
+  createdAt: string;
+  thresholdPct: number;
+  consecutiveRequired: number;
+  streakLength: number;
+  streakRangeAr: string;
+  streakRangeEn: string;
+  latestPairAr: string;
+  latestPairEn: string;
+  titleAr: string;
+  titleEn: string;
+  messageAr: string;
+  messageEn: string;
+  channel: 'auto_monitor' | 'manual_dispatch';
+  acknowledged: boolean;
+}
+
 const BUDGET_STORAGE_KEY = 'estadat_cost_center_budgets_v1';
 const FC_NOTIF_STORAGE_KEY = 'estadat_food_cost_notifications_v1';
 const STK_NOTIF_STORAGE_KEY = 'estadat_stocktake_notifications_v1';
+const REV_GROWTH_NOTIF_STORAGE_KEY = 'estadat_rev_growth_notifications_v1';
 
 const DEFAULT_COST_CENTER_BUDGETS: Record<CostCenterId, number> = {
   'CC-HR': 550000,
@@ -153,10 +186,22 @@ function loadSavedStocktakeNotifications(): StocktakeVarianceNotification[] {
   }
 }
 
+function loadSavedRevenueGrowthNotifications(): RevenueGrowthAlertNotification[] {
+  try {
+    const raw = localStorage.getItem(REV_GROWTH_NOTIF_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.slice(0, 20) : [];
+  } catch {
+    return [];
+  }
+}
+
 export const CfoDashboard: React.FC<CfoDashboardProps> = ({
   state,
   lang,
   onNavigate,
+  onOpenPerformanceReview,
   onQuickReorder,
   onNavigateToStocktakeReconcile,
   onReconcileStocktake,
@@ -203,6 +248,26 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
   const [activeStocktakeToast, setActiveStocktakeToast] = useState<StocktakeVarianceNotification | null>(null);
   const lastStocktakeNotifSigRef = useRef<string>('');
 
+  // Automated Consecutive MoM Revenue Growth (< 5% for 2+ months) Alerts
+  const [revGrowthThresholdPct, setRevGrowthThresholdPct] = useState<number>(5);
+  const [revConsecutiveTarget, setRevConsecutiveTarget] = useState<number>(2);
+  const [revGrowthBannerDismissed, setRevGrowthBannerDismissed] = useState(false);
+  const [showRevGrowthNotifLog, setShowRevGrowthNotifLog] = useState(false);
+  const [revGrowthNotifications, setRevGrowthNotifications] = useState<RevenueGrowthAlertNotification[]>(
+    loadSavedRevenueGrowthNotifications
+  );
+  const [activeRevGrowthToast, setActiveRevGrowthToast] = useState<RevenueGrowthAlertNotification | null>(null);
+  const lastRevGrowthNotifSigRef = useRef<string>('');
+
+  const openPerformanceReviewDrilldown = () => {
+    setActiveRevGrowthToast(null);
+    if (onOpenPerformanceReview) {
+      onOpenPerformanceReview();
+    } else {
+      onNavigate('cfo_review');
+    }
+  };
+
   // Quick Investment ROI Simulator (80% Unused Land) synced with InvestmentRoiSimulatorModule
   const [quickRoiInputs, setQuickRoiInputs] = useState<RoiSimulatorInputs>(loadSavedRoiInputs);
   const quickRoiSim = useMemo(() => runRoiSimulation(quickRoiInputs), [quickRoiInputs]);
@@ -210,6 +275,7 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
   // Board-Ready CFO A4 Print Preview & Sections
   const [cfoPrintPreviewOpen, setCfoPrintPreviewOpen] = useState(false);
   const [cfoPrintSections, setCfoPrintSections] = useState<CfoPrintSectionId[]>(ALL_CFO_PRINT_SECTIONS);
+  const [cfoPrintCurrentViewMode, setCfoPrintCurrentViewMode] = useState(false);
 
   const updateQuickRoi = (patch: Partial<RoiSimulatorInputs>) => {
     setQuickRoiInputs((prev) => {
@@ -305,6 +371,215 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
     };
   }, [state.monthlyActuals2026, period, excludeUsufructRent, livePosDelta]);
 
+  const monthlyTrendSeries = useMemo(() => {
+    const raw = buildMonthlyTrendSeries(state, excludeUsufructRent, period === '9m_plus_live');
+    return raw.map((pt) => ({
+      ...pt,
+      shortMonth: lang === 'ar' ? pt.monthLabelAr.split(' ')[0] : pt.monthLabelEn.slice(0, 3),
+      ebitdaActive: excludeUsufructRent ? pt.ebitdaExUsufruct : pt.ebitdaInclUsufruct,
+    }));
+  }, [state, excludeUsufructRent, period, lang]);
+
+  const latestTrendStats = useMemo(() => {
+    const audited = monthlyTrendSeries.filter((p) => p.quarter !== 'Q4');
+    return audited[audited.length - 1] ?? monthlyTrendSeries[monthlyTrendSeries.length - 1];
+  }, [monthlyTrendSeries]);
+
+  // Automated Monitor: Detect when MoM Revenue Growth falls below threshold (default 5%) for 2+ consecutive months
+  const revenueGrowthMonitor = useMemo(() => {
+    const audited = monthlyTrendSeries.filter((p) => p.quarter !== 'Q4');
+    let runningStreak = 0;
+
+    const evaluatedMonths = audited.map((pt, idx) => {
+      const prev = idx > 0 ? audited[idx - 1] : null;
+      const momPct = pt.revMomPct;
+      const deltaNetEgp = prev ? round2(pt.netRevenue - prev.netRevenue) : null;
+      const isBelowThreshold = momPct !== null && momPct < revGrowthThresholdPct;
+      runningStreak = isBelowThreshold ? runningStreak + 1 : 0;
+      const gapToThresholdPct = momPct !== null ? round2(revGrowthThresholdPct - momPct) : null;
+
+      return {
+        ...pt,
+        prevNetRevenue: prev?.netRevenue ?? null,
+        deltaNetEgp,
+        isBelowThreshold,
+        consecutiveBelowCount: runningStreak,
+        isConsecutiveTriggerMonth: runningStreak >= revConsecutiveTarget,
+        gapToThresholdPct,
+      };
+    });
+
+    type EvaluatedMonth = (typeof evaluatedMonths)[number];
+    interface GrowthStreak {
+      id: string;
+      months: EvaluatedMonth[];
+      length: number;
+      startMonthKey: string;
+      endMonthKey: string;
+      rangeLabelAr: string;
+      rangeLabelEn: string;
+      avgMomPct: number;
+      minMomPct: number;
+    }
+
+    const streaks: GrowthStreak[] = [];
+    let currentRun: EvaluatedMonth[] = [];
+    const flushRun = () => {
+      if (currentRun.length >= revConsecutiveTarget) {
+        const first = currentRun[0];
+        const last = currentRun[currentRun.length - 1];
+        const avgMomPct = round2(
+          currentRun.reduce((acc, m) => acc + (m.revMomPct ?? 0), 0) / currentRun.length
+        );
+        const minMomPct = round2(Math.min(...currentRun.map((m) => m.revMomPct ?? 0)));
+        streaks.push({
+          id: `${first.month}_${last.month}`,
+          months: [...currentRun],
+          length: currentRun.length,
+          startMonthKey: first.month,
+          endMonthKey: last.month,
+          rangeLabelAr: `${first.monthLabelAr} ← ${last.monthLabelAr}`,
+          rangeLabelEn: `${first.monthLabelEn} → ${last.monthLabelEn}`,
+          avgMomPct,
+          minMomPct,
+        });
+      }
+      currentRun = [];
+    };
+
+    evaluatedMonths.forEach((m) => {
+      if (m.isBelowThreshold) {
+        currentRun.push(m);
+      } else {
+        flushRun();
+      }
+    });
+    flushRun();
+
+    const latestStreak = streaks.length > 0 ? streaks[streaks.length - 1] : null;
+    const latestPair =
+      latestStreak && latestStreak.months.length >= 2
+        ? latestStreak.months.slice(-2)
+        : null;
+    const belowMonthsCount = evaluatedMonths.filter((m) => m.isBelowThreshold).length;
+    const maxConsecutiveStreak = evaluatedMonths.reduce(
+      (mx, m) => Math.max(mx, m.consecutiveBelowCount),
+      0
+    );
+
+    return {
+      evaluatedMonths,
+      streaks,
+      latestStreak,
+      latestPair,
+      belowMonthsCount,
+      maxConsecutiveStreak,
+      triggered: streaks.length > 0,
+    };
+  }, [monthlyTrendSeries, revGrowthThresholdPct, revConsecutiveTarget]);
+
+  const saveRevGrowthNotificationsToStorage = (items: RevenueGrowthAlertNotification[]) => {
+    try {
+      localStorage.setItem(REV_GROWTH_NOTIF_STORAGE_KEY, JSON.stringify(items.slice(0, 20)));
+    } catch {
+      // ignore storage errors
+    }
+  };
+
+  const dispatchRevenueGrowthNotification = (channel: 'auto_monitor' | 'manual_dispatch') => {
+    const latestStreak = revenueGrowthMonitor.latestStreak;
+    const latestPair = revenueGrowthMonitor.latestPair;
+    if (!latestStreak || !latestPair) return;
+
+    const [mA, mB] = latestPair;
+    const fmtSignedPct = (v: number | null) =>
+      v === null ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`;
+    const nowLabel = new Date().toISOString().slice(0, 16).replace('T', ' ');
+    const sig = `REVMOM:${revGrowthThresholdPct}:${revConsecutiveTarget}:${latestStreak.endMonthKey}:${latestStreak.length}:${Math.round((mB.revMomPct ?? 0) * 10)}`;
+
+    const pairAr = `${mA.shortMonth} (${fmtSignedPct(mA.revMomPct)}) و${mB.shortMonth} (${fmtSignedPct(mB.revMomPct)})`;
+    const pairEn = `${mA.shortMonth} (${fmtSignedPct(mA.revMomPct)}) & ${mB.shortMonth} (${fmtSignedPct(mB.revMomPct)})`;
+
+    const notif: RevenueGrowthAlertNotification = {
+      id: `RGN-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      signature: sig,
+      createdAt: `${nowLabel} UTC`,
+      thresholdPct: revGrowthThresholdPct,
+      consecutiveRequired: revConsecutiveTarget,
+      streakLength: latestStreak.length,
+      streakRangeAr: latestStreak.rangeLabelAr,
+      streakRangeEn: latestStreak.rangeLabelEn,
+      latestPairAr: pairAr,
+      latestPairEn: pairEn,
+      titleAr: `تنبيه تباطؤ نمو الإيرادات: ${latestStreak.length} شهور متتالية < ${revGrowthThresholdPct}% MoM`,
+      titleEn: `MoM Revenue Slowdown Alert: ${latestStreak.length} Consecutive Months < ${revGrowthThresholdPct}%`,
+      messageAr: `سجل صافي الإيراد نمواً شهرياً أقل من ${revGrowthThresholdPct}% لمدة ${latestStreak.length} شهور متتالية (${latestStreak.rangeLabelAr}) — آخر شهرين: ${pairAr}. يُنصح بمراجعة وحدة تقييم الأداء المالي فوراً.`,
+      messageEn: `MoM net revenue growth fell below ${revGrowthThresholdPct}% for ${latestStreak.length} consecutive months (${latestStreak.rangeLabelEn}) — latest pair: ${pairEn}. Drill down into Performance Review.`,
+      channel,
+      acknowledged: false,
+    };
+
+    setRevGrowthNotifications((prev) => {
+      const next = [notif, ...prev].slice(0, 20);
+      saveRevGrowthNotificationsToStorage(next);
+      return next;
+    });
+    setActiveRevGrowthToast(notif);
+
+    if (typeof window !== 'undefined' && 'Notification' in window) {
+      try {
+        if (Notification.permission === 'granted') {
+          new Notification(lang === 'ar' ? notif.titleAr : notif.titleEn, {
+            body: lang === 'ar' ? notif.messageAr : notif.messageEn,
+          });
+        } else if (channel === 'manual_dispatch' && Notification.permission === 'default') {
+          Notification.requestPermission()
+            .then((perm) => {
+              if (perm === 'granted') {
+                new Notification(lang === 'ar' ? notif.titleAr : notif.titleEn, {
+                  body: lang === 'ar' ? notif.messageAr : notif.messageEn,
+                });
+              }
+            })
+            .catch(() => {});
+        }
+      } catch {
+        // ignore browser notification restrictions
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (!revenueGrowthMonitor.triggered || !revenueGrowthMonitor.latestStreak || !revenueGrowthMonitor.latestPair) {
+      return;
+    }
+    const latestStreak = revenueGrowthMonitor.latestStreak;
+    const latestMonth = revenueGrowthMonitor.latestPair[1];
+    const sig = `REVMOM:${revGrowthThresholdPct}:${revConsecutiveTarget}:${latestStreak.endMonthKey}:${latestStreak.length}:${Math.round((latestMonth.revMomPct ?? 0) * 10)}`;
+    if (lastRevGrowthNotifSigRef.current === sig) return;
+    lastRevGrowthNotifSigRef.current = sig;
+
+    const existing = revGrowthNotifications.find((n) => n.signature === sig && !n.acknowledged);
+    if (!existing) {
+      dispatchRevenueGrowthNotification('auto_monitor');
+    } else {
+      setActiveRevGrowthToast(existing);
+    }
+    setRevGrowthBannerDismissed(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    revGrowthThresholdPct,
+    revConsecutiveTarget,
+    revenueGrowthMonitor.triggered,
+    revenueGrowthMonitor.latestStreak?.id,
+    revenueGrowthMonitor.latestStreak?.length,
+  ]);
+
+  const unreadRevGrowthNotifCount = useMemo(
+    () => revGrowthNotifications.filter((n) => !n.acknowledged).length,
+    [revGrowthNotifications]
+  );
+
   const waterfallSteps = useMemo(() => {
     return [
       { labelAr: 'إجمالي المبيعات', labelEn: 'Gross Sales', val: metrics.gross, running: metrics.gross, type: 'total' as const },
@@ -350,162 +625,10 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
     return stockAlerts.filter((a) => a.severity === alertFilter);
   }, [stockAlerts, alertFilter]);
 
-  const vatSummary = useMemo(() => {
-    const vatRate = state.vatRate || 0.14;
-    const rows =
-      period === 'Q1' || period === 'Q2' || period === 'Q3'
-        ? state.monthlyActuals2026.filter((m) => m.quarter === period)
-        : state.monthlyActuals2026;
-
-    const audited9MInputVat = 585000;
-    const audited9MCogs = state.monthlyActuals2026.reduce((a, m) => a + m.cogs, 0);
-
-    const livePurchases = state.purchaseInvoices.filter((p) => !p.id.startsWith('PO-SEED-'));
-    const livePurchaseVat = round2(livePurchases.reduce((a, p) => a + p.vatAmount, 0));
-    const livePurchasesNet = round2(livePurchases.reduce((a, p) => a + p.totalBeforeTax, 0));
-
-    const liveTaxableExpenses = state.expenses.filter((e) => !e.id.startsWith('EXP-SEED-') && e.vatAmount > 0);
-    const liveExpenseVat = round2(liveTaxableExpenses.reduce((a, e) => a + e.vatAmount, 0));
-    const liveTaxableExpNet = round2(liveTaxableExpenses.reduce((a, e) => a + e.amountNet, 0));
-
-    const liveInputVat = round2(livePurchaseVat + liveExpenseVat);
-
-    const includeLive = period === '9m_plus_live';
-    const baseOutputVat = round2(rows.reduce((a, m) => a + m.vatOutput, 0));
-    const baseInputVat = round2(
-      rows.reduce(
-        (a, m) => a + (audited9MCogs > 0 ? (m.cogs / audited9MCogs) * audited9MInputVat : 0),
-        0
-      )
-    );
-    const basePurchasesNet = round2(vatRate > 0 ? baseInputVat / vatRate : 0);
-
-    const outputVat = round2(baseOutputVat + (includeLive ? livePosDelta.vat : 0));
-    const inputVat = round2(baseInputVat + (includeLive ? liveInputVat : 0));
-    const taxablePurchasesBase = round2(
-      basePurchasesNet + (includeLive ? livePurchasesNet + liveTaxableExpNet : 0)
-    );
-    const netVatPayable = round2(outputVat - inputVat);
-    const recoveryRatioPct = outputVat > 0 ? round2((inputVat / outputVat) * 100) : 0;
-    const effectiveOutputRatePct = metrics.net > 0 ? round2((outputVat / metrics.net) * 100) : 0;
-    const outputToInputRatio = inputVat > 0 ? round2(outputVat / inputVat) : 0;
-    const netVatBurdenPct = metrics.net > 0 ? round2((netVatPayable / metrics.net) * 100) : 0;
-
-    const rawMonthly = rows.map((m) => {
-      const mInputVat = round2(audited9MCogs > 0 ? (m.cogs / audited9MCogs) * audited9MInputVat : 0);
-      const mNetPayable = round2(m.vatOutput - mInputVat);
-      const mOffsetPct = m.vatOutput > 0 ? round2((mInputVat / m.vatOutput) * 100) : 0;
-      return {
-        key: m.monthKey,
-        labelAr: m.labelAr,
-        labelEn: m.labelEn,
-        netSales: m.netRevenue,
-        purchasesNet: round2(vatRate > 0 ? mInputVat / vatRate : 0),
-        outputVat: m.vatOutput,
-        inputVat: mInputVat,
-        netPayable: mNetPayable,
-        offsetPct: mOffsetPct,
-      };
-    });
-
-    if (includeLive && (livePosDelta.count > 0 || liveInputVat > 0)) {
-      const liveNetPayable = round2(livePosDelta.vat - liveInputVat);
-      rawMonthly.push({
-        key: 'live-oct',
-        labelAr: 'أكتوبر (مباشر)',
-        labelEn: 'Oct (Live)',
-        netSales: livePosDelta.net,
-        purchasesNet: round2(livePurchasesNet + liveTaxableExpNet),
-        outputVat: livePosDelta.vat,
-        inputVat: liveInputVat,
-        netPayable: liveNetPayable,
-        offsetPct: livePosDelta.vat > 0 ? round2((liveInputVat / livePosDelta.vat) * 100) : 0,
-      });
-    }
-
-    const monthlyBreakdown = rawMonthly.map((item, idx) => {
-      const prev = idx > 0 ? rawMonthly[idx - 1] : null;
-      const momDeltaPct =
-        prev && Math.abs(prev.netPayable) > 0
-          ? round2(((item.netPayable - prev.netPayable) / Math.abs(prev.netPayable)) * 100)
-          : null;
-      return { ...item, momDeltaPct };
-    });
-
-    const maxMonthlyVatBar = Math.max(
-      1,
-      ...monthlyBreakdown.map((r) => Math.max(r.outputVat, r.inputVat))
-    );
-
-    const salesPosInvoices = state.salesInvoices.filter((s) => s.source === 'pos');
-    const salesFoodicsInvoices = state.salesInvoices.filter((s) => s.source !== 'pos');
-    const salesPosVat = round2(salesPosInvoices.reduce((a, s) => a + s.vatAmount, 0));
-    const salesFoodicsVat = round2(salesFoodicsInvoices.reduce((a, s) => a + s.vatAmount, 0));
-    const seededPurchaseVat = round2(
-      state.purchaseInvoices
-        .filter((p) => p.id.startsWith('PO-SEED-'))
-        .reduce((a, p) => a + p.vatAmount, 0)
-    );
-
-    const etaSubmittedCount = state.salesInvoices.filter((inv) => inv.etaStatus === 'submitted').length;
-    const etaQueuedCount = state.salesInvoices.filter((inv) => inv.etaStatus === 'queued_offline').length;
-    const ledgerOutput2201 = balances['2201'] ?? 0;
-    const ledgerInput1105 = balances['1105'] ?? 0;
-
-    const periodLabelAr =
-      period === '9m_ytd'
-        ? 'يناير – سبتمبر 2026 (9 شهور)'
-        : period === '9m_plus_live'
-        ? '9 شهور + العمليات المباشرة'
-        : `${period} 2026`;
-    const periodLabelEn =
-      period === '9m_ytd'
-        ? 'Jan – Sep 2026 (9M YTD)'
-        : period === '9m_plus_live'
-        ? '9M YTD + Live Operations'
-        : `${period} 2026`;
-
-    return {
-      vatRate,
-      outputVat,
-      inputVat,
-      taxablePurchasesBase,
-      netVatPayable,
-      recoveryRatioPct,
-      effectiveOutputRatePct,
-      outputToInputRatio,
-      netVatBurdenPct,
-      monthlyBreakdown,
-      maxMonthlyVatBar,
-      etaSubmittedCount,
-      etaQueuedCount,
-      ledgerOutput2201,
-      ledgerInput1105,
-      ledgerNetPayable: round2(ledgerOutput2201 - ledgerInput1105),
-      livePurchaseVat,
-      liveExpenseVat,
-      livePurchasesNet,
-      liveTaxableExpNet,
-      seededPurchaseVat,
-      salesPosVat,
-      salesFoodicsVat,
-      salesPosCount: salesPosInvoices.length,
-      salesFoodicsCount: salesFoodicsInvoices.length,
-      livePurchasesCount: livePurchases.length,
-      periodLabelAr,
-      periodLabelEn,
-    };
-  }, [
-    period,
-    state.vatRate,
-    state.monthlyActuals2026,
-    state.purchaseInvoices,
-    state.expenses,
-    state.salesInvoices,
-    livePosDelta,
-    metrics.net,
-    balances,
-  ]);
+  const vatSummary = useMemo(
+    () => computeCfoVatSummary(state, period, metrics.net, balances),
+    [state, period, metrics.net, balances]
+  );
 
   const activeVatMonth = useMemo(() => {
     if (vatSummary.monthlyBreakdown.length === 0) return null;
@@ -520,9 +643,14 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
       'Period',
       'Net Taxable Sales (EGP)',
       'Output VAT 14% Acc 2201 (EGP)',
-      'Est. Taxable Purchases (EGP)',
-      'Input VAT 14% Acc 1105 (EGP)',
-      'Input Offset Ratio (%)',
+      'Deductible Purchases Base (EGP)',
+      'Deductible Input VAT 14% Acc 1105 (EGP)',
+      'Non-Deductible COGS Input VAT (EGP)',
+      'Non-Deductible OpEx 5301 Input VAT (EGP)',
+      'Total Non-Deductible Input VAT (EGP)',
+      'Total Gross Input VAT Incurred (EGP)',
+      'Deductibility Share (%)',
+      'Input Offset vs Output (%)',
       'Net VAT Payable to ETA (EGP)',
       'MoM Change (%)',
     ];
@@ -531,7 +659,12 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
       r.netSales.toFixed(2),
       r.outputVat.toFixed(2),
       r.purchasesNet.toFixed(2),
-      r.inputVat.toFixed(2),
+      r.deductibleInputVat.toFixed(2),
+      r.nonDeductibleCogsVat.toFixed(2),
+      r.nonDeductibleOpexVat.toFixed(2),
+      r.nonDeductibleInputVat.toFixed(2),
+      r.totalInputVatIncurred.toFixed(2),
+      r.deductibilityPct.toFixed(2),
       r.offsetPct.toFixed(2),
       r.netPayable.toFixed(2),
       r.momDeltaPct !== null ? r.momDeltaPct.toFixed(2) : '',
@@ -541,7 +674,12 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
       metrics.net.toFixed(2),
       vatSummary.outputVat.toFixed(2),
       vatSummary.taxablePurchasesBase.toFixed(2),
-      vatSummary.inputVat.toFixed(2),
+      vatSummary.deductibleInputVat.toFixed(2),
+      vatSummary.nonDeductibleCogsVat.toFixed(2),
+      vatSummary.nonDeductibleOpexVat.toFixed(2),
+      vatSummary.nonDeductibleInputVat.toFixed(2),
+      vatSummary.totalInputVatIncurred.toFixed(2),
+      vatSummary.deductibilityRatioPct.toFixed(2),
       vatSummary.recoveryRatioPct.toFixed(2),
       vatSummary.netVatPayable.toFixed(2),
       '',
@@ -551,7 +689,7 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `estadat_vat_comparative_${period}_${new Date().toISOString().slice(0, 10)}.csv`;
+    a.download = `estadat_vat_eta_audit_${period}_${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -1130,7 +1268,29 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
 
           <button
             type="button"
-            onClick={() => setCfoPrintPreviewOpen(true)}
+            onClick={() => {
+              setCfoPrintCurrentViewMode(true);
+              setCfoPrintSections(['exec_pnl']);
+              setCfoPrintPreviewOpen(true);
+            }}
+            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-xs font-semibold transition-colors whitespace-nowrap shrink-0 no-print cursor-pointer"
+            title={t(
+              lang,
+              'فتح نافذة الطباعة بإعداد مسبق لالتقاط بطاقات KPI الحالية والرسوم البيانية في تقرير PDF',
+              'Open print modal pre-configured to capture active KPI cards and MoM trend charts as PDF'
+            )}
+          >
+            <FileDown className="w-3.5 h-3.5" />
+            <span>{t(lang, 'تصدير العرض الحالي كـ PDF', 'Export Current View as PDF')}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setCfoPrintCurrentViewMode(false);
+              setCfoPrintSections(ALL_CFO_PRINT_SECTIONS);
+              setCfoPrintPreviewOpen(true);
+            }}
             className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-300 bg-white text-slate-800 hover:bg-slate-50 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 no-print cursor-pointer"
             title={t(lang, 'معاينة وتنسيق الطباعة الجاهزة للمدير المالي (A4)', 'Preview & configure CFO board-ready A4 print')}
           >
@@ -1140,7 +1300,10 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
 
           <button
             type="button"
-            onClick={() => window.print()}
+            onClick={() => {
+              setCfoPrintCurrentViewMode(false);
+              window.print();
+            }}
             className="p-2 rounded-lg border border-slate-200 bg-white text-slate-600 hover:text-slate-900 hover:bg-slate-50 no-print cursor-pointer"
             title={t(lang, 'طباعة حزمة CFO الجاهزة مباشرة (A4)', 'Print CFO A4 Pack Now')}
           >
@@ -1148,6 +1311,94 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Top Automated Revenue Growth Alert Banner (< 5% MoM for 2+ Consecutive Months) */}
+      {!revGrowthBannerDismissed &&
+        revenueGrowthMonitor.triggered &&
+        revenueGrowthMonitor.latestStreak &&
+        revenueGrowthMonitor.latestPair && (
+          <div
+            role="alert"
+            className="rounded-xl border border-red-200 dark:border-red-800/80 bg-red-50/90 dark:bg-red-950/45 text-red-950 dark:text-red-100 px-4 py-3.5 flex flex-col lg:flex-row lg:items-center justify-between gap-3"
+          >
+            <div className="flex items-start gap-3">
+              <div className="p-2 rounded-lg border border-red-200 dark:border-red-700 bg-red-100 dark:bg-red-900/60 text-red-700 dark:text-red-300 shrink-0">
+                <TrendingDown className="w-4 h-4" />
+              </div>
+              <div className="space-y-1.5">
+                <div className="flex flex-wrap items-center gap-2 text-xs font-bold">
+                  <span>
+                    {t(
+                      lang,
+                      `تنبيه تلقائي لتباطؤ نمو الإيرادات (نمو شهري < ${revGrowthThresholdPct}% لـ ${revConsecutiveTarget}+ شهور متتالية):`,
+                      `Automated Revenue Growth Alert (MoM Growth < ${revGrowthThresholdPct}% for ${revConsecutiveTarget}+ Consecutive Months):`
+                    )}
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-white/90 dark:bg-slate-900 border border-red-200 dark:border-red-700 text-red-700 dark:text-red-300 font-mono-num text-[11px]" dir="ltr">
+                    {revenueGrowthMonitor.latestStreak.length} {t(lang, 'شهور متتالية', 'Consecutive Mos')} ·{' '}
+                    {lang === 'ar'
+                      ? revenueGrowthMonitor.latestStreak.rangeLabelAr
+                      : revenueGrowthMonitor.latestStreak.rangeLabelEn}
+                  </span>
+                </div>
+                <p className="text-xs text-red-900/85 dark:text-red-200/85">
+                  {(() => {
+                    const [mA, mB] = revenueGrowthMonitor.latestPair!;
+                    const pA = mA.revMomPct ?? 0;
+                    const pB = mB.revMomPct ?? 0;
+                    return t(
+                      lang,
+                      `تم رصد ${revenueGrowthMonitor.streaks.length} موجات تباطؤ متتالية في 2026، أحدثها في ${mA.monthLabelAr} (${pA >= 0 ? '+' : ''}${pA.toFixed(1)}%) و${mB.monthLabelAr} (${pB >= 0 ? '+' : ''}${pB.toFixed(1)}%) — أقل من المستهدف (+${revGrowthThresholdPct}.0%).`,
+                      `Detected ${revenueGrowthMonitor.streaks.length} consecutive slowdown streak(s) in 2026. Most recent consecutive pair: ${mA.monthLabelEn} (${pA >= 0 ? '+' : ''}${pA.toFixed(1)}%) & ${mB.monthLabelEn} (${pB >= 0 ? '+' : ''}${pB.toFixed(1)}%) vs +${revGrowthThresholdPct}.0% threshold.`
+                    );
+                  })()}
+                </p>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {revenueGrowthMonitor.streaks.map((st) => (
+                    <a
+                      key={st.id}
+                      href="#revenue-growth-alerts"
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-red-200 dark:border-red-700 bg-white dark:bg-slate-900 text-red-800 dark:text-red-200 text-[11px] font-semibold hover:bg-red-50 dark:hover:bg-red-950/60 transition-colors"
+                    >
+                      <span className="font-mono-num" dir="ltr">
+                        {lang === 'ar' ? st.rangeLabelAr : st.rangeLabelEn}
+                      </span>
+                      <span className="text-slate-400">·</span>
+                      <span className="font-mono-num font-bold text-red-700 dark:text-red-300" dir="ltr">
+                        Avg {st.avgMomPct >= 0 ? '+' : ''}{st.avgMomPct.toFixed(1)}% MoM
+                      </span>
+                    </a>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={openPerformanceReviewDrilldown}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-700 hover:bg-red-800 text-white text-xs font-semibold whitespace-nowrap cursor-pointer transition-colors"
+              >
+                <span>{t(lang, 'فحص التفاصيل: وحدة مراجعة الأداء', 'Drill-Down: Performance Review')}</span>
+                <ArrowUpRight className="w-3.5 h-3.5" />
+              </button>
+              <a
+                href="#revenue-growth-alerts"
+                className="px-3 py-1.5 rounded-lg border border-red-300 dark:border-red-700 bg-white dark:bg-slate-900 text-red-800 dark:text-red-200 text-xs font-semibold whitespace-nowrap hover:bg-red-50 dark:hover:bg-red-950/60 transition-colors"
+              >
+                {t(lang, 'السجل الشهري MoM', 'Monthly MoM Table')}
+              </a>
+              <button
+                type="button"
+                onClick={() => setRevGrowthBannerDismissed(true)}
+                aria-label={t(lang, 'إخفاء تنبيه نمو الإيرادات', 'Dismiss revenue growth alert')}
+                className="p-1.5 rounded-lg border border-red-300/70 dark:border-red-700 bg-white/70 dark:bg-slate-900/70 text-red-700 dark:text-red-300 hover:text-red-950 cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+        )}
 
       {/* Top Proactive Cost-Center Visual Warning Banner */}
       {!bannerDismissed && costCenterMonitor.activeWarnings.length > 0 && (
@@ -1624,44 +1875,188 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
         )}
       </section>
 
-      {/* Primary KPI Grid (4 + 4) */}
+      {/* Primary KPI Grid (4 + 4) with MoM Recharts Trend Line Charts on Revenue, Gross Profit & EBITDA */}
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
-        <div className="bg-white border border-slate-200 rounded-xl p-4">
-          <div className="text-xs font-medium text-slate-500">
-            {t(lang, 'إجمالي الإيرادات (شامل VAT 14%)', 'Gross Revenue (Incl. VAT)')}
+        {/* Card 1: Revenue + Recharts MoM Trend */}
+        <div
+          className={`bg-white rounded-xl p-4 flex flex-col justify-between border ${
+            revenueGrowthMonitor.triggered ? 'border-red-300' : 'border-slate-200'
+          }`}
+        >
+          <div>
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-xs font-medium text-slate-500">
+                {t(lang, 'إجمالي الإيرادات (شامل VAT 14%)', 'Gross Revenue (Incl. VAT)')}
+              </div>
+              <div className="flex items-center gap-1">
+                {revenueGrowthMonitor.triggered && (
+                  <button
+                    type="button"
+                    onClick={openPerformanceReviewDrilldown}
+                    title={t(
+                      lang,
+                      'نمو الإيراد أقل من 5% لشهرين متتاليين — اضغط للانتقال لوحدة مراجعة الأداء',
+                      'MoM revenue growth < 5% for 2+ consecutive months — click to open Performance Review'
+                    )}
+                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold bg-red-600 text-white hover:bg-red-700 cursor-pointer transition-colors whitespace-nowrap"
+                  >
+                    <TrendingDown className="w-2.5 h-2.5" />
+                    <span className="font-mono-num" dir="ltr">
+                      {revenueGrowthMonitor.latestStreak?.length ?? 2}m &lt;{revGrowthThresholdPct}%
+                    </span>
+                  </button>
+                )}
+                {latestTrendStats?.revMomPct !== null && latestTrendStats?.revMomPct !== undefined && (
+                  <span
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold font-mono-num ${
+                      latestTrendStats.revMomPct >= revGrowthThresholdPct
+                        ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                        : latestTrendStats.revMomPct >= 0
+                        ? 'bg-amber-50 text-amber-800 border border-amber-200'
+                        : 'bg-red-50 text-red-700 border border-red-200'
+                    }`}
+                    dir="ltr"
+                  >
+                    {latestTrendStats.revMomPct >= 0 ? '+' : ''}
+                    {latestTrendStats.revMomPct.toFixed(1)}% MoM
+                  </span>
+                )}
+              </div>
+            </div>
+            <div className="mt-2 flex items-baseline justify-between gap-2">
+              <span className="text-2xl font-bold text-slate-900 font-mono-num" dir="ltr">{fmtMoney(metrics.gross)}</span>
+              <span className="text-xs text-slate-500">{t(lang, 'ج.م', 'EGP')}</span>
+            </div>
           </div>
-          <div className="mt-2 flex items-baseline justify-between gap-2">
-            <span className="text-2xl font-bold text-slate-900 font-mono-num" dir="ltr">{fmtMoney(metrics.gross)}</span>
-            <span className="text-xs text-slate-500">{t(lang, 'ج.م', 'EGP')}</span>
+
+          <div className="mt-2 h-[74px] w-full" dir="ltr">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={monthlyTrendSeries} margin={{ top: 6, right: 4, left: 4, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="revTrendGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#0f766e" stopOpacity={0.22} />
+                    <stop offset="95%" stopColor="#0f766e" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <XAxis dataKey="shortMonth" tick={{ fontSize: 9, fill: '#64748b' }} tickLine={false} axisLine={false} />
+                <Tooltip
+                  formatter={(value) => [`${fmtMoney(Number(value ?? 0), 0)} EGP`, t(lang, 'صافي الإيراد', 'Net Revenue')]}
+                  contentStyle={{ fontSize: '11px', borderRadius: '8px', borderColor: '#cbd5e1' }}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="netRevenue"
+                  stroke="#0f766e"
+                  strokeWidth={2}
+                  fill="url(#revTrendGrad)"
+                  dot={{ r: 2, fill: '#0f766e' }}
+                />
+              </AreaChart>
+            </ResponsiveContainer>
           </div>
-          <div className="mt-2 pt-2 border-t border-slate-100 flex items-center justify-between text-xs text-slate-500">
-            <span>{t(lang, 'صافي بعد VAT', 'Net Ex-VAT')}</span>
-            <span className="font-mono-num font-semibold text-slate-800" dir="ltr">{fmtMoney(metrics.net)}</span>
+
+          <div className="mt-2 pt-2 border-t border-slate-100 flex items-center justify-between gap-2 text-xs text-slate-500">
+            <span>
+              {t(lang, 'صافي بعد VAT:', 'Net Ex-VAT:')}{' '}
+              <span className="font-mono-num font-semibold text-slate-800" dir="ltr">{fmtMoney(metrics.net)}</span>
+            </span>
+            {revenueGrowthMonitor.triggered && (
+              <button
+                type="button"
+                onClick={openPerformanceReviewDrilldown}
+                className="text-[11px] font-bold text-red-700 hover:underline inline-flex items-center gap-0.5 cursor-pointer shrink-0"
+              >
+                <span>{t(lang, 'مراجعة الأداء', 'Perf. Review')}</span>
+                <ArrowUpRight className="w-3 h-3" />
+              </button>
+            )}
           </div>
         </div>
 
-        <div className="bg-white border border-slate-200 rounded-xl p-4">
-          <div className="text-xs font-medium text-slate-500">
-            {t(lang, 'مجمل الربح (GP) والهامش', 'Gross Profit & GP Margin')}
+        {/* Card 2: Gross Profit + Recharts MoM Trend */}
+        <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between">
+          <div>
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-xs font-medium text-slate-500">
+                {t(lang, 'مجمل الربح (GP) والهامش', 'Gross Profit & GP Margin')}
+              </div>
+              {latestTrendStats?.gpMomPct !== null && latestTrendStats?.gpMomPct !== undefined && (
+                <span
+                  className={`px-1.5 py-0.5 rounded text-[10px] font-bold font-mono-num ${
+                    latestTrendStats.gpMomPct >= 0
+                      ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                      : 'bg-red-50 text-red-700 border border-red-200'
+                  }`}
+                  dir="ltr"
+                >
+                  {latestTrendStats.gpMomPct >= 0 ? '+' : ''}
+                  {latestTrendStats.gpMomPct.toFixed(1)}% MoM
+                </span>
+              )}
+            </div>
+            <div className="mt-2 flex items-baseline justify-between gap-2">
+              <span className="text-2xl font-bold text-slate-900 font-mono-num" dir="ltr">{fmtMoney(metrics.gp)}</span>
+              <span className="text-sm font-bold text-emerald-700 font-mono-num" dir="ltr">{fmtPct(metrics.gpMarginPct)}</span>
+            </div>
           </div>
-          <div className="mt-2 flex items-baseline justify-between gap-2">
-            <span className="text-2xl font-bold text-slate-900 font-mono-num" dir="ltr">{fmtMoney(metrics.gp)}</span>
-            <span className="text-sm font-bold text-emerald-700 font-mono-num" dir="ltr">{fmtPct(metrics.gpMarginPct)}</span>
+
+          <div className="mt-2 h-[74px] w-full" dir="ltr">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={monthlyTrendSeries} margin={{ top: 6, right: 4, left: 4, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="gpTrendGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#059669" stopOpacity={0.22} />
+                    <stop offset="95%" stopColor="#059669" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <XAxis dataKey="shortMonth" tick={{ fontSize: 9, fill: '#64748b' }} tickLine={false} axisLine={false} />
+                <Tooltip
+                  formatter={(value) => [`${fmtMoney(Number(value ?? 0), 0)} EGP`, t(lang, 'مجمل الربح', 'Gross Profit')]}
+                  contentStyle={{ fontSize: '11px', borderRadius: '8px', borderColor: '#cbd5e1' }}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="grossProfit"
+                  stroke="#059669"
+                  strokeWidth={2}
+                  fill="url(#gpTrendGrad)"
+                  dot={{ r: 2, fill: '#059669' }}
+                />
+              </AreaChart>
+            </ResponsiveContainer>
           </div>
+
           <div className="mt-2 pt-2 border-t border-slate-100 flex items-center justify-between text-xs">
             <span className="text-slate-500">{t(lang, 'المتوسط الشهري', 'Monthly Avg Net')}</span>
             <span className="font-mono-num text-slate-700 font-medium" dir="ltr">{fmtMoney(round2(metrics.net / metrics.monthsCount))}</span>
           </div>
         </div>
 
-        <div className="bg-white border border-slate-200 rounded-xl p-4">
-          <div className="text-xs font-medium text-slate-500">
-            {t(lang, 'تكلفة المبيعات COGS %', 'COGS % (Target 28–35%)')}
+        {/* Card 3: COGS % */}
+        <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between">
+          <div>
+            <div className="text-xs font-medium text-slate-500">
+              {t(lang, 'تكلفة المبيعات COGS %', 'COGS % (Target 28–35%)')}
+            </div>
+            <div className="mt-2 flex items-baseline justify-between gap-2">
+              <span className="text-2xl font-bold text-amber-700 font-mono-num" dir="ltr">{fmtPct(metrics.foodCostPct)}</span>
+              <span className="text-xs text-slate-600 font-mono-num" dir="ltr">{fmtMoney(metrics.cogs)} {t(lang, 'ج.م', 'EGP')}</span>
+            </div>
+            <div className="mt-4 space-y-1.5">
+              <div className="flex justify-between text-[11px] text-slate-500 font-mono-num" dir="ltr">
+                <span>0%</span>
+                <span className="font-semibold text-teal-700">Target 35%</span>
+                <span>50%+</span>
+              </div>
+              <div className="w-full h-2 rounded-full bg-slate-100 overflow-hidden">
+                <div
+                  className={`h-full rounded-full ${metrics.foodCostPct <= 35 ? 'bg-emerald-600' : 'bg-amber-600'}`}
+                  style={{ width: `${Math.min(100, Math.max(8, metrics.foodCostPct * 1.8))}%` }}
+                />
+              </div>
+            </div>
           </div>
-          <div className="mt-2 flex items-baseline justify-between gap-2">
-            <span className="text-2xl font-bold text-amber-700 font-mono-num" dir="ltr">{fmtPct(metrics.foodCostPct)}</span>
-            <span className="text-xs text-slate-600 font-mono-num" dir="ltr">{fmtMoney(metrics.cogs)} {t(lang, 'ج.م', 'EGP')}</span>
-          </div>
+
           <div className="mt-2 pt-2 border-t border-slate-100 flex items-center justify-between text-xs">
             <span className="text-slate-500">{t(lang, 'المستهدف 2027: ≤ 35%', '2027 Target: ≤ 35%')}</span>
             <button onClick={() => onNavigate('inventory')} className="text-teal-700 hover:underline font-medium">
@@ -1670,20 +2065,66 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
           </div>
         </div>
 
-        <div className="bg-white border border-slate-200 rounded-xl p-4">
-          <div className="text-xs font-medium text-slate-500">
-            {excludeUsufructRent
-              ? t(lang, 'النتيجة التشغيلية بدون حق الانتفاع', 'Operating Result (Ex-Usufruct)')
-              : t(lang, 'صافي النتيجة المحاسبية', 'Net Profit / (Loss)')}
+        {/* Card 4: EBITDA / Operating Result + Recharts MoM Trend */}
+        <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col justify-between">
+          <div>
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-xs font-medium text-slate-500">
+                {excludeUsufructRent
+                  ? t(lang, 'EBITDA / النتيجة التشغيلية (بدون الانتفاع)', 'EBITDA / Operating Result (Ex-Usufruct)')
+                  : t(lang, 'EBITDA / صافي النتيجة المحاسبية', 'EBITDA / Net Operating Result')}
+              </div>
+              {latestTrendStats?.ebitdaMomPct !== null && latestTrendStats?.ebitdaMomPct !== undefined && (
+                <span
+                  className={`px-1.5 py-0.5 rounded text-[10px] font-bold font-mono-num ${
+                    latestTrendStats.ebitdaMomPct >= 0
+                      ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                      : 'bg-red-50 text-red-700 border border-red-200'
+                  }`}
+                  dir="ltr"
+                >
+                  {latestTrendStats.ebitdaMomPct >= 0 ? '+' : ''}
+                  {latestTrendStats.ebitdaMomPct.toFixed(1)}% MoM
+                </span>
+              )}
+            </div>
+            <div className="mt-2 flex items-baseline justify-between gap-2">
+              <span className={`text-2xl font-bold font-mono-num ${metrics.netProfit >= 0 ? 'text-emerald-700' : 'text-red-600'}`} dir="ltr">
+                {fmtMoney(metrics.netProfit)}
+              </span>
+              <span className={`text-sm font-bold font-mono-num ${metrics.netMarginPct >= 0 ? 'text-emerald-700' : 'text-red-600'}`} dir="ltr">
+                {fmtPct(metrics.netMarginPct)}
+              </span>
+            </div>
           </div>
-          <div className="mt-2 flex items-baseline justify-between gap-2">
-            <span className={`text-2xl font-bold font-mono-num ${metrics.netProfit >= 0 ? 'text-emerald-700' : 'text-red-600'}`} dir="ltr">
-              {fmtMoney(metrics.netProfit)}
-            </span>
-            <span className={`text-sm font-bold font-mono-num ${metrics.netMarginPct >= 0 ? 'text-emerald-700' : 'text-red-600'}`} dir="ltr">
-              {fmtPct(metrics.netMarginPct)}
-            </span>
+
+          <div className="mt-2 h-[74px] w-full" dir="ltr">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={monthlyTrendSeries} margin={{ top: 6, right: 4, left: 4, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="ebitdaTrendGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor={metrics.netProfit >= 0 ? '#059669' : '#dc2626'} stopOpacity={0.22} />
+                    <stop offset="95%" stopColor={metrics.netProfit >= 0 ? '#059669' : '#dc2626'} stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <XAxis dataKey="shortMonth" tick={{ fontSize: 9, fill: '#64748b' }} tickLine={false} axisLine={false} />
+                <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="2 2" />
+                <Tooltip
+                  formatter={(value) => [`${fmtMoney(Number(value ?? 0), 0)} EGP`, 'EBITDA']}
+                  contentStyle={{ fontSize: '11px', borderRadius: '8px', borderColor: '#cbd5e1' }}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="ebitdaActive"
+                  stroke={metrics.netProfit >= 0 ? '#059669' : '#dc2626'}
+                  strokeWidth={2}
+                  fill="url(#ebitdaTrendGrad)"
+                  dot={{ r: 2, fill: metrics.netProfit >= 0 ? '#059669' : '#dc2626' }}
+                />
+              </AreaChart>
+            </ResponsiveContainer>
           </div>
+
           <div className="mt-2 pt-2 border-t border-slate-100 flex items-center justify-between text-xs">
             <span className="text-slate-500">{t(lang, 'وتيرة خسارة 2026: -5.5م/سنة', 'Annualized 2026: -5.5M')}</span>
             <button onClick={() => onNavigate('strategy')} className="text-teal-700 hover:underline font-medium">
@@ -1948,8 +2389,8 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
                 <h2 className="text-sm font-bold text-slate-900 dark:text-slate-100">
                   {t(
                     lang,
-                    'ملخص ضريبة القيمة المضافة (VAT Summary 14%) — التحليل المقارن للمخرجات والمدخلات',
-                    'VAT Summary (14%) — Output vs. Input Comparative Analysis'
+                    'ملخص ضريبة القيمة المضافة (VAT Summary 14%) — المخرجات والمدخلات المخصومة وغير المخصومة',
+                    'VAT Summary (14%) — Output vs. Deductible & Non-Deductible Input Audit'
                   )}
                 </h2>
                 <span aria-hidden="true" className="text-slate-300 dark:text-slate-600">·</span>
@@ -1969,6 +2410,12 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
                     `${vatSummary.etaSubmittedCount} فاتورة مرسلة لمنظومة ETA`,
                     `${vatSummary.etaSubmittedCount} Invoices Submitted to ETA`
                   )}
+                </span>
+                <span aria-hidden="true">·</span>
+                <span className="font-mono-num font-medium text-amber-700 dark:text-amber-400" dir="ltr">
+                  {t(lang, 'مدخلات غير مخصومة:', 'Non-Deductible Input:')}{' '}
+                  {fmtMoney(vatSummary.nonDeductibleInputVat, 0)} {t(lang, 'ج.م', 'EGP')} (
+                  {fmtPct(vatSummary.nonDeductibleSharePct, 1)})
                 </span>
                 {vatSummary.etaQueuedCount > 0 && (
                   <>
@@ -1992,6 +2439,7 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
                 [
                   { id: 'chart', ar: 'المقارنة البيانية', en: 'Comparative Chart' },
                   { id: 'schedule', ar: 'جدول نموذج 10', en: 'Form 10 Schedule' },
+                  { id: 'audit', ar: 'المخصوم وغير المخصوم', en: 'Deductibility Audit' },
                   { id: 'sources', ar: 'مصادر الفواتير', en: 'Sources & GL' },
                 ] as const
               ).map((tab) => (
@@ -2037,9 +2485,9 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
           </div>
         </div>
 
-        {/* 3-Column Output vs Input vs Net VAT Payable */}
+        {/* 3-Column Output vs Deductible/Non-Deductible Input vs Net VAT Payable */}
         <div className="grid grid-cols-1 md:grid-cols-3 divide-y md:divide-y-0 md:divide-x md:rtl:divide-x-reverse divide-slate-200 dark:divide-slate-800">
-          {/* Output VAT */}
+          {/* Column 1: Output VAT */}
           <div className="p-5 space-y-2">
             <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
               <span>{t(lang, 'ضريبة المخرجات (من المبيعات 14%)', 'Output VAT Collected (Sales 14%)')}</span>
@@ -2053,39 +2501,55 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
               </span>
               <span className="text-xs text-slate-500 dark:text-slate-400">{t(lang, 'ج.م', 'EGP')}</span>
             </div>
-            <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-              <span>{t(lang, 'وعاء المبيعات الصافي', 'Taxable Net Sales')}</span>
-              <span className="font-mono-num font-semibold text-slate-700 dark:text-slate-200" dir="ltr">
-                {fmtMoney(metrics.net, 0)} ({fmtPct(vatSummary.effectiveOutputRatePct, 1)})
-              </span>
+            <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-1 text-xs text-slate-500 dark:text-slate-400">
+              <div className="flex items-center justify-between">
+                <span>{t(lang, 'وعاء المبيعات الصافي الخاضع', 'Taxable Net Sales Base')}</span>
+                <span className="font-mono-num font-semibold text-slate-700 dark:text-slate-200" dir="ltr">
+                  {fmtMoney(metrics.net, 0)} ({fmtPct(vatSummary.effectiveOutputRatePct, 1)})
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span>{t(lang, 'صافي الإقرار الافتراضي لو خُصم الكل', 'Pro-Forma Net if 100% Deductible')}</span>
+                <span className="font-mono-num font-medium text-slate-600 dark:text-slate-300" dir="ltr">
+                  {fmtMoney(vatSummary.hypotheticalNetPayableIfAllDeductible, 0)} {t(lang, 'ج.م', 'EGP')}
+                </span>
+              </div>
             </div>
           </div>
 
-          {/* Input VAT */}
+          {/* Column 2: Input VAT Breakdown (Deductible Acc 1105 vs Non-Deductible Cost/OpEx) */}
           <div className="p-5 space-y-2">
             <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-              <span>{t(lang, 'ضريبة المدخلات (من المشتريات المخصومة)', 'Input VAT Paid (Deductible Purchases)')}</span>
+              <span>{t(lang, 'ضريبة المدخلات المخصومة (ETA نموذج 10)', 'Deductible Input VAT (ETA Creditable)')}</span>
               <span className="font-mono-num text-[11px] font-semibold text-emerald-700 dark:text-emerald-400" dir="ltr">
                 Acc 1105
               </span>
             </div>
             <div className="flex items-baseline justify-between gap-2">
               <span className="text-2xl font-bold text-emerald-700 dark:text-emerald-400 font-mono-num" dir="ltr">
-                -{fmtMoney(vatSummary.inputVat, 2)}
+                -{fmtMoney(vatSummary.deductibleInputVat, 2)}
               </span>
               <span className="text-xs font-mono-num font-semibold text-emerald-700 dark:text-emerald-400" dir="ltr">
-                {fmtPct(vatSummary.recoveryRatioPct, 1)} {t(lang, 'استرداد', 'offset')}
+                {fmtPct(vatSummary.deductibilityRatioPct, 1)} {t(lang, 'قابل للخصم', 'deductible')}
               </span>
             </div>
-            <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-              <span>{t(lang, 'وعاء المشتريات التقديري', 'Taxable Purchases Base')}</span>
-              <span className="font-mono-num font-semibold text-slate-700 dark:text-slate-200" dir="ltr">
-                {fmtMoney(vatSummary.taxablePurchasesBase, 0)} {t(lang, 'ج.م', 'EGP')}
-              </span>
+            <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-1 text-xs">
+              <div className="flex items-center justify-between text-amber-800 dark:text-amber-300">
+                <span>{t(lang, 'مدخلات غير قابلة للخصم (محملة بالتكلفة)', 'Non-Deductible Input VAT (Absorbed)')}</span>
+                <span className="font-mono-num font-bold" dir="ltr">
+                  {fmtMoney(vatSummary.nonDeductibleInputVat, 2)} ({fmtPct(vatSummary.nonDeductibleSharePct, 1)})
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-slate-500 dark:text-slate-400">
+                <span>{t(lang, 'إجمالي ضريبة المدخلات المتكبدة فعلياً', 'Total Gross Input VAT Incurred')}</span>
+                <span className="font-mono-num font-semibold text-slate-700 dark:text-slate-200" dir="ltr">
+                  {fmtMoney(vatSummary.totalInputVatIncurred, 2)} {t(lang, 'ج.م', 'EGP')}
+                </span>
+              </div>
             </div>
           </div>
 
-          {/* Net VAT Payable to ETA */}
+          {/* Column 3: Net VAT Payable to ETA */}
           <div className="p-5 space-y-2 bg-slate-50/50 dark:bg-slate-800/30">
             <div className="flex items-center justify-between text-xs text-slate-600 dark:text-slate-300 font-medium">
               <span>
@@ -2110,11 +2574,19 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
                 {vatSummary.outputToInputRatio.toFixed(2)}x
               </span>
             </div>
-            <div className="pt-2 border-t border-slate-200/80 dark:border-slate-700 flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-              <span>{t(lang, 'صافي العبء الضريبي من المبيعات', 'Net VAT % of Sales')}</span>
-              <span className="font-mono-num font-semibold text-slate-800 dark:text-slate-200" dir="ltr">
-                {fmtPct(vatSummary.netVatBurdenPct, 2)} · GL {fmtMoney(vatSummary.ledgerNetPayable, 0)}
-              </span>
+            <div className="pt-2 border-t border-slate-200/80 dark:border-slate-700 space-y-1 text-xs text-slate-500 dark:text-slate-400">
+              <div className="flex items-center justify-between">
+                <span>{t(lang, 'صافي العبء الضريبي من المبيعات', 'Net VAT % of Sales')}</span>
+                <span className="font-mono-num font-semibold text-slate-800 dark:text-slate-200" dir="ltr">
+                  {fmtPct(vatSummary.netVatBurdenPct, 2)} · GL {fmtMoney(vatSummary.ledgerNetPayable, 0)}
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span>{t(lang, 'عبء ضريبة غير مخصوم (تكلفة 5101/5301)', 'Disallowed VAT Leakage (5101/5301)')}</span>
+                <span className="font-mono-num font-semibold text-amber-700 dark:text-amber-400" dir="ltr">
+                  +{fmtMoney(vatSummary.nonDeductibleInputVat, 0)} {t(lang, 'ج.م', 'EGP')}
+                </span>
+              </div>
             </div>
           </div>
         </div>
@@ -2122,21 +2594,27 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
         {/* Comparative Metrics Strip */}
         <div className="grid grid-cols-2 lg:grid-cols-4 divide-y lg:divide-y-0 divide-x rtl:divide-x-reverse divide-slate-200 dark:divide-slate-800 border-t border-slate-200 dark:border-slate-800 bg-slate-50/40 dark:bg-slate-800/20 text-xs">
           <div className="px-5 py-2.5 flex items-center justify-between gap-2">
-            <span className="text-slate-500 dark:text-slate-400">{t(lang, 'نسبة تغطية المدخلات', 'Input Tax Shield')}</span>
+            <span className="text-slate-500 dark:text-slate-400">
+              {t(lang, 'المخصوم / غير المخصوم', 'Deductible / Non-Deductible')}
+            </span>
+            <span className="font-mono-num font-bold text-slate-900 dark:text-slate-100" dir="ltr">
+              <span className="text-emerald-700 dark:text-emerald-400">{fmtPct(vatSummary.deductibilityRatioPct, 1)}</span>
+              {' / '}
+              <span className="text-amber-700 dark:text-amber-400">{fmtPct(vatSummary.nonDeductibleSharePct, 1)}</span>
+            </span>
+          </div>
+          <div className="px-5 py-2.5 flex items-center justify-between gap-2">
+            <span className="text-slate-500 dark:text-slate-400">{t(lang, 'درع خصم المخرجات (1105/2201)', 'Output Tax Shield')}</span>
             <span className="font-mono-num font-bold text-emerald-700 dark:text-emerald-400" dir="ltr">
-              {fmtPct(vatSummary.recoveryRatioPct, 1)}
+              {fmtPct(vatSummary.recoveryRatioPct, 1)} ({vatSummary.outputToInputRatio.toFixed(2)}:1)
             </span>
           </div>
           <div className="px-5 py-2.5 flex items-center justify-between gap-2">
-            <span className="text-slate-500 dark:text-slate-400">{t(lang, 'نسبة المخرجات / المدخلات', 'Output / Input Ratio')}</span>
-            <span className="font-mono-num font-bold text-slate-900 dark:text-slate-100" dir="ltr">
-              {vatSummary.outputToInputRatio.toFixed(2)} : 1
+            <span className="text-slate-500 dark:text-slate-400">
+              {t(lang, 'غير مخصوم: COGS / OpEx 5301', 'Non-Deduct: COGS / OpEx')}
             </span>
-          </div>
-          <div className="px-5 py-2.5 flex items-center justify-between gap-2">
-            <span className="text-slate-500 dark:text-slate-400">{t(lang, 'فرق الوعاءين (مبيعات - مشتريات)', 'Value-Added Base Spread')}</span>
-            <span className="font-mono-num font-bold text-slate-900 dark:text-slate-100" dir="ltr">
-              {fmtMoney(round2(metrics.net - vatSummary.taxablePurchasesBase), 0)} {t(lang, 'ج.م', 'EGP')}
+            <span className="font-mono-num font-bold text-amber-700 dark:text-amber-400" dir="ltr">
+              {fmtMoney(vatSummary.nonDeductibleCogsVat, 0)} / {fmtMoney(vatSummary.nonDeductibleOpexVat, 0)}
             </span>
           </div>
           <div className="px-5 py-2.5 flex items-center justify-between gap-2">
@@ -2147,10 +2625,10 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
           </div>
         </div>
 
-        {/* View 1: Comparative Chart & Tax Shield */}
+        {/* View 1: Comparative Chart & Deductible vs Non-Deductible Tax Shield */}
         {vatViewMode === 'chart' && (
           <div className="p-5 border-t border-slate-200 dark:border-slate-800 space-y-5">
-            {/* Grouped Monthly Output vs Input Comparative Chart */}
+            {/* Grouped Monthly Output vs Deductible Input vs Non-Deductible Input Comparative Chart */}
             <div className="space-y-3">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
@@ -2158,26 +2636,30 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
                   <h3 className="text-xs font-bold text-slate-800 dark:text-slate-200">
                     {t(
                       lang,
-                      'التحليل الشهري المقارن: ضريبة المخرجات (المبيعات) مقابل ضريبة المدخلات (المشتريات)',
-                      'Monthly Comparative Analysis: Output VAT (Sales) vs. Input VAT (Purchases)'
+                      'التحليل الشهري المقارن: ضريبة المخرجات مقابل المدخلات المخصومة (1105) وغير المخصومة',
+                      'Monthly Comparative Analysis: Output VAT vs. Deductible (1105) & Non-Deductible Input VAT'
                     )}
                   </h3>
                 </div>
                 <div className="flex flex-wrap items-center gap-4 text-[11px] text-slate-600 dark:text-slate-400">
                   <span className="inline-flex items-center gap-1.5">
                     <span className="w-2.5 h-2.5 rounded-xs bg-teal-700 dark:bg-teal-500 inline-block" />
-                    <span>{t(lang, 'ضريبة المخرجات (مبيعات 14%)', 'Output VAT (Sales)')}</span>
+                    <span>{t(lang, 'مخرجات المبيعات (2201)', 'Output VAT (2201)')}</span>
                   </span>
                   <span className="inline-flex items-center gap-1.5">
                     <span className="w-2.5 h-2.5 rounded-xs bg-emerald-600 dark:bg-emerald-500 inline-block" />
-                    <span>{t(lang, 'ضريبة المدخلات (مشتريات 14%)', 'Input VAT (Purchases)')}</span>
+                    <span>{t(lang, 'مدخلات مخصومة (1105)', 'Deductible Input (1105)')}</span>
+                  </span>
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 rounded-xs bg-amber-500 dark:bg-amber-400 inline-block" />
+                    <span>{t(lang, 'مدخلات غير مخصومة', 'Non-Deductible Input')}</span>
                   </span>
                 </div>
               </div>
 
               {/* Interactive Month Focus Readout */}
               {activeVatMonth && (
-                <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 px-4 py-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/40 text-xs">
+                <div className="grid grid-cols-2 sm:grid-cols-6 gap-3 px-4 py-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-800/40 text-xs">
                   <div>
                     <div className="text-[11px] text-slate-500 dark:text-slate-400">
                       {t(lang, 'الشهر المحدد للفحص', 'Focused Month')}
@@ -2188,7 +2670,7 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
                   </div>
                   <div>
                     <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                      {t(lang, 'مخرجات المبيعات', 'Output VAT')}
+                      {t(lang, 'مخرجات المبيعات (2201)', 'Output VAT')}
                     </div>
                     <div className="font-mono-num font-bold text-teal-700 dark:text-teal-300 mt-0.5" dir="ltr">
                       {fmtMoney(activeVatMonth.outputVat, 0)} {t(lang, 'ج.م', 'EGP')}
@@ -2196,29 +2678,37 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
                   </div>
                   <div>
                     <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                      {t(lang, 'مدخلات المشتريات', 'Input VAT')}
+                      {t(lang, 'مدخلات مخصومة (1105)', 'Deductible Input')}
                     </div>
                     <div className="font-mono-num font-bold text-emerald-700 dark:text-emerald-400 mt-0.5" dir="ltr">
-                      -{fmtMoney(activeVatMonth.inputVat, 0)} {t(lang, 'ج.م', 'EGP')}
+                      -{fmtMoney(activeVatMonth.deductibleInputVat, 0)} {t(lang, 'ج.م', 'EGP')}
                     </div>
                   </div>
                   <div>
                     <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                      {t(lang, 'صافي المستحق للـ ETA', 'Net Payable')}
+                      {t(lang, 'مدخلات غير مخصومة', 'Non-Deductible Input')}
+                    </div>
+                    <div className="font-mono-num font-bold text-amber-700 dark:text-amber-400 mt-0.5" dir="ltr">
+                      {fmtMoney(activeVatMonth.nonDeductibleInputVat, 0)} {t(lang, 'ج.م', 'EGP')}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                      {t(lang, 'نسبة القابلية للخصم', 'Deductibility %')}
+                    </div>
+                    <div className="font-mono-num font-bold text-slate-800 dark:text-slate-200 mt-0.5" dir="ltr">
+                      {fmtPct(activeVatMonth.deductibilityPct, 1)}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                      {t(lang, 'صافي المستحق للـ ETA', 'Net Payable (ETA)')}
                     </div>
                     <div className="font-mono-num font-bold text-slate-900 dark:text-slate-100 mt-0.5" dir="ltr">
-                      {fmtMoney(activeVatMonth.netPayable, 0)} {t(lang, 'ج.م', 'EGP')}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                      {t(lang, 'نسبة الخصم والتغير الشهري', 'Offset % · MoM')}
-                    </div>
-                    <div className="font-mono-num font-bold text-slate-700 dark:text-slate-200 mt-0.5" dir="ltr">
-                      {fmtPct(activeVatMonth.offsetPct, 1)}
+                      {fmtMoney(activeVatMonth.netPayable, 0)}
                       {activeVatMonth.momDeltaPct !== null && (
                         <span
-                          className={`ms-1.5 ${
+                          className={`ms-1.5 text-[11px] ${
                             activeVatMonth.momDeltaPct > 0
                               ? 'text-amber-700 dark:text-amber-400'
                               : 'text-emerald-700 dark:text-emerald-400'
@@ -2233,12 +2723,13 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
                 </div>
               )}
 
-              {/* Grouped Vertical Bar Columns */}
+              {/* Grouped Vertical Bar Columns (3 Bars per Month: Output / Deductible / Non-Deductible) */}
               <div className="overflow-x-auto pb-1">
-                <div className="min-w-[560px] grid gap-2 pt-2" style={{ gridTemplateColumns: `repeat(${vatSummary.monthlyBreakdown.length}, minmax(0, 1fr))` }}>
+                <div className="min-w-[600px] grid gap-2 pt-2" style={{ gridTemplateColumns: `repeat(${vatSummary.monthlyBreakdown.length}, minmax(0, 1fr))` }}>
                   {vatSummary.monthlyBreakdown.map((m) => {
                     const outH = Math.max(8, Math.round((m.outputVat / vatSummary.maxMonthlyVatBar) * 140));
-                    const inH = Math.max(6, Math.round((m.inputVat / vatSummary.maxMonthlyVatBar) * 140));
+                    const inH = Math.max(6, Math.round((m.deductibleInputVat / vatSummary.maxMonthlyVatBar) * 140));
+                    const nonDedH = Math.max(4, Math.round((m.nonDeductibleInputVat / vatSummary.maxMonthlyVatBar) * 140));
                     const isSelected = activeVatMonth?.key === m.key;
 
                     return (
@@ -2251,10 +2742,10 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
                             ? 'bg-teal-50/60 dark:bg-teal-950/40 border-teal-300 dark:border-teal-700'
                             : 'bg-white dark:bg-slate-900 border-slate-100 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800/50'
                         }`}
-                        title={`${lang === 'ar' ? m.labelAr : m.labelEn} — Output: ${fmtMoney(m.outputVat, 0)} | Input: ${fmtMoney(m.inputVat, 0)}`}
+                        title={`${lang === 'ar' ? m.labelAr : m.labelEn} — Output: ${fmtMoney(m.outputVat, 0)} | Deductible: ${fmtMoney(m.deductibleInputVat, 0)} | Non-Deductible: ${fmtMoney(m.nonDeductibleInputVat, 0)}`}
                       >
-                        <div className="h-[156px] w-full flex items-end justify-center gap-1.5 pb-1 border-b border-slate-200 dark:border-slate-700">
-                          <div className="flex flex-col items-center gap-1 flex-1 max-w-[22px]">
+                        <div className="h-[156px] w-full flex items-end justify-center gap-1 pb-1 border-b border-slate-200 dark:border-slate-700">
+                          <div className="flex flex-col items-center gap-1 flex-1 max-w-[18px]">
                             <span className="text-[9px] font-mono-num text-slate-600 dark:text-slate-300" dir="ltr">
                               {Math.round(m.outputVat / 1000)}k
                             </span>
@@ -2263,13 +2754,22 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
                               style={{ height: `${outH}px` }}
                             />
                           </div>
-                          <div className="flex flex-col items-center gap-1 flex-1 max-w-[22px]">
+                          <div className="flex flex-col items-center gap-1 flex-1 max-w-[18px]">
                             <span className="text-[9px] font-mono-num text-emerald-700 dark:text-emerald-400" dir="ltr">
-                              {Math.round(m.inputVat / 1000)}k
+                              {Math.round(m.deductibleInputVat / 1000)}k
                             </span>
                             <div
                               className="w-full rounded-t bg-emerald-600 dark:bg-emerald-500 transition-all"
                               style={{ height: `${inH}px` }}
+                            />
+                          </div>
+                          <div className="flex flex-col items-center gap-1 flex-1 max-w-[18px]">
+                            <span className="text-[9px] font-mono-num text-amber-700 dark:text-amber-400" dir="ltr">
+                              {Math.round(m.nonDeductibleInputVat / 1000)}k
+                            </span>
+                            <div
+                              className="w-full rounded-t bg-amber-500 dark:bg-amber-400 transition-all"
+                              style={{ height: `${nonDedH}px` }}
                             />
                           </div>
                         </div>
@@ -2277,7 +2777,7 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
                           {lang === 'ar' ? m.labelAr : m.labelEn}
                         </span>
                         <span className="text-[10px] font-mono-num text-slate-500 dark:text-slate-400" dir="ltr">
-                          {t(lang, 'صافي', 'Net')}: {Math.round(m.netPayable / 1000)}k
+                          {t(lang, 'خصم', 'Ded')}: {fmtPct(m.deductibilityPct, 0)}
                         </span>
                       </button>
                     );
@@ -2286,111 +2786,163 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
               </div>
             </div>
 
-            {/* Visual Output VAT vs Input Offset Stacked Bar */}
-            <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-2">
-              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                <span className="font-medium text-slate-700 dark:text-slate-300">
-                  {t(
-                    lang,
-                    'تغطية ضريبة المدخلات مقابل ضريبة المخرجات للفترة المختارة (تأثير الإقرار الضريبي)',
-                    'Input VAT Tax Shield vs. Net ETA Remittance Share'
-                  )}
-                </span>
-                <div className="flex flex-wrap items-center gap-4 text-[11px] text-slate-600 dark:text-slate-400">
+            {/* Dual Stacked Bars: Output Offset Shield + Input VAT Deductibility Split */}
+            <div className="pt-4 border-t border-slate-200 dark:border-slate-800 grid grid-cols-1 lg:grid-cols-2 gap-5">
+              {/* Bar A: Output VAT Tax Shield */}
+              <div className="space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                    {t(lang, 'تغطية المخرجات بالمدخلات المخصومة (ETA نموذج 10)', 'Output VAT Offset vs. Net ETA Remittance')}
+                  </span>
+                  <span className="font-mono-num text-[11px] text-slate-600 dark:text-slate-400" dir="ltr">
+                    {fmtPct(Math.min(100, vatSummary.recoveryRatioPct), 1)} {t(lang, 'خصم', 'offset')}
+                  </span>
+                </div>
+                <div
+                  className="w-full h-3 rounded-md bg-slate-100 dark:bg-slate-800 overflow-hidden flex"
+                  role="img"
+                  aria-label="Output VAT offset by Deductible Input VAT"
+                >
+                  <div
+                    className="h-full bg-emerald-600 dark:bg-emerald-500 transition-transform duration-150"
+                    style={{ width: `${Math.min(100, Math.max(0, vatSummary.recoveryRatioPct))}%` }}
+                    title={`${t(lang, 'مدخلات مخصومة 1105', 'Deductible Input VAT')}: ${fmtMoney(vatSummary.deductibleInputVat, 0)} EGP`}
+                  />
+                  <div
+                    className="h-full bg-teal-700 dark:bg-teal-500 transition-transform duration-150"
+                    style={{ width: `${Math.max(0, 100 - Math.min(100, vatSummary.recoveryRatioPct))}%` }}
+                    title={`${t(lang, 'صافي المستحق لـ ETA', 'Net ETA Payable')}: ${fmtMoney(vatSummary.netVatPayable, 0)} EGP`}
+                  />
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500 dark:text-slate-400">
                   <span className="inline-flex items-center gap-1.5">
-                    <span className="w-2.5 h-2.5 rounded-xs bg-emerald-600 inline-block" />
-                    <span>
-                      {t(lang, 'مدخلات مخصومة', 'Input Offset')} ({fmtPct(Math.min(100, vatSummary.recoveryRatioPct), 1)})
+                    <span className="w-2 h-2 rounded-xs bg-emerald-600 inline-block" />
+                    <span className="font-mono-num" dir="ltr">
+                      1105: {fmtMoney(vatSummary.deductibleInputVat, 0)} EGP
                     </span>
                   </span>
                   <span className="inline-flex items-center gap-1.5">
-                    <span className="w-2.5 h-2.5 rounded-xs bg-teal-700 dark:bg-teal-500 inline-block" />
-                    <span>
-                      {t(lang, 'صافي واجب السداد للـ ETA', 'Net Payable to ETA')} (
-                      {fmtPct(Math.max(0, 100 - vatSummary.recoveryRatioPct), 1)})
+                    <span className="w-2 h-2 rounded-xs bg-teal-700 inline-block" />
+                    <span className="font-mono-num" dir="ltr">
+                      ETA Net: {fmtMoney(vatSummary.netVatPayable, 0)} EGP
                     </span>
                   </span>
                 </div>
               </div>
 
-              <div
-                className="w-full h-3 rounded-md bg-slate-100 dark:bg-slate-800 overflow-hidden flex"
-                role="img"
-                aria-label="Output VAT offset by Input VAT"
-              >
-                <div
-                  className="h-full bg-emerald-600 dark:bg-emerald-500 transition-transform duration-150"
-                  style={{ width: `${Math.min(100, Math.max(0, vatSummary.recoveryRatioPct))}%` }}
-                  title={`${t(lang, 'ضريبة المدخلات', 'Input VAT')}: ${fmtMoney(vatSummary.inputVat, 0)} EGP`}
-                />
-                <div
-                  className="h-full bg-teal-700 dark:bg-teal-500 transition-transform duration-150"
-                  style={{ width: `${Math.max(0, 100 - Math.min(100, vatSummary.recoveryRatioPct))}%` }}
-                  title={`${t(lang, 'صافي المستحق لـ ETA', 'Net ETA Payable')}: ${fmtMoney(vatSummary.netVatPayable, 0)} EGP`}
-                />
-              </div>
-
-              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500 dark:text-slate-400">
-                <span>
-                  {t(
-                    lang,
-                    'ضريبة المخرجات تُجمع من POS وفودكس (14%) وتُخصم منها فواتير المشتريات الضريبية المعتمدة (1105).',
-                    '14% Output VAT from POS & Foodics sales offset by tax-verified supplier purchase invoices (Account 1105).'
-                  )}
-                </span>
-                <span>
-                  {t(
-                    lang,
-                    'مهلة تقديم إقرار القيمة المضافة: خلال شهر من انتهاء الفترة الضريبية',
-                    'ETA Form 10 Deadline: Within 1 month after tax period close'
-                  )}
-                </span>
+              {/* Bar B: Input VAT Deductibility Split (Deductible 1105 vs Non-Deductible COGS vs Non-Deductible OpEx) */}
+              <div className="space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                    {t(lang, 'هيكل ضريبة المدخلات المتكبدة (مخصوم مقابل غير مخصوم)', 'Total Input VAT Composition (Deductible vs. Non-Deductible)')}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setVatViewMode('audit')}
+                    className="text-[11px] font-semibold text-teal-700 dark:text-teal-300 hover:underline cursor-pointer"
+                  >
+                    {t(lang, 'عرض تدقيق ETA الكامل ←', 'Full ETA Audit Breakdown →')}
+                  </button>
+                </div>
+                {(() => {
+                  const totalIn = Math.max(1, vatSummary.totalInputVatIncurred);
+                  const dedW = round2((vatSummary.deductibleInputVat / totalIn) * 100);
+                  const nonDedCogsW = round2((vatSummary.nonDeductibleCogsVat / totalIn) * 100);
+                  const nonDedOpexW = Math.max(0, round2(100 - dedW - nonDedCogsW));
+                  return (
+                    <div
+                      className="w-full h-3 rounded-md bg-slate-100 dark:bg-slate-800 overflow-hidden flex"
+                      role="img"
+                      aria-label="Deductible vs Non-Deductible Input VAT Split"
+                    >
+                      <div
+                        className="h-full bg-emerald-600 dark:bg-emerald-500"
+                        style={{ width: `${dedW}%` }}
+                        title={`${t(lang, 'مخصوم 1105', 'Deductible Acc 1105')}: ${fmtMoney(vatSummary.deductibleInputVat, 0)} EGP`}
+                      />
+                      <div
+                        className="h-full bg-amber-500 dark:bg-amber-400"
+                        style={{ width: `${nonDedCogsW}%` }}
+                        title={`${t(lang, 'غير مخصوم — خامات بدون فاتورة إلكترونية', 'Non-Deductible COGS')}: ${fmtMoney(vatSummary.nonDeductibleCogsVat, 0)} EGP`}
+                      />
+                      <div
+                        className="h-full bg-rose-500 dark:bg-rose-400"
+                        style={{ width: `${nonDedOpexW}%` }}
+                        title={`${t(lang, 'غير مخصوم — مصروفات 5301', 'Non-Deductible OpEx 5301')}: ${fmtMoney(vatSummary.nonDeductibleOpexVat, 0)} EGP`}
+                      />
+                    </div>
+                  );
+                })()}
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500 dark:text-slate-400">
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-xs bg-emerald-600 inline-block" />
+                    <span className="font-mono-num" dir="ltr">
+                      {t(lang, 'مخصوم 1105:', 'Deductible:')} {fmtMoney(vatSummary.deductibleInputVat, 0)}
+                    </span>
+                  </span>
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-xs bg-amber-500 inline-block" />
+                    <span className="font-mono-num" dir="ltr">
+                      {t(lang, 'خامات غير مفوترة:', 'COGS Disallowed:')} {fmtMoney(vatSummary.nonDeductibleCogsVat, 0)}
+                    </span>
+                  </span>
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-xs bg-rose-500 inline-block" />
+                    <span className="font-mono-num" dir="ltr">
+                      {t(lang, 'مصروفات 5301:', 'OpEx Disallowed:')} {fmtMoney(vatSummary.nonDeductibleOpexVat, 0)}
+                    </span>
+                  </span>
+                </div>
               </div>
             </div>
           </div>
         )}
 
-        {/* View 2: Monthly Filing Breakdown Table (ETA Form 10) */}
+        {/* View 2: Monthly Filing Breakdown Table (ETA Form 10 with Deductible vs Non-Deductible) */}
         {vatViewMode === 'schedule' && (
           <div className="border-t border-slate-200 dark:border-slate-800 overflow-x-auto">
             <table className="w-full text-xs">
               <thead>
                 <tr className="bg-slate-50 dark:bg-slate-800/80 border-b border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300">
-                  <th className="py-2.5 px-4 text-start font-semibold">{t(lang, 'الفترة الضريبية', 'Tax Period')}</th>
-                  <th className="py-2.5 px-4 text-end font-semibold">{t(lang, 'وعاء المبيعات الصافي', 'Net Taxable Sales')}</th>
-                  <th className="py-2.5 px-4 text-end font-semibold">{t(lang, 'ضريبة المخرجات (2201)', 'Output VAT (2201)')}</th>
-                  <th className="py-2.5 px-4 text-end font-semibold">{t(lang, 'وعاء المشتريات التقديري', 'Taxable Purchases')}</th>
-                  <th className="py-2.5 px-4 text-end font-semibold">{t(lang, 'ضريبة المدخلات (1105)', 'Input VAT (1105)')}</th>
-                  <th className="py-2.5 px-4 text-end font-semibold">{t(lang, 'نسبة الخصم %', 'Offset %')}</th>
-                  <th className="py-2.5 px-4 text-end font-semibold">{t(lang, 'صافي المستحق للـ ETA', 'Net Payable (ETA)')}</th>
-                  <th className="py-2.5 px-4 text-end font-semibold">{t(lang, 'التغير الشهري', 'MoM %')}</th>
+                  <th className="py-2.5 px-3.5 text-start font-semibold">{t(lang, 'الفترة الضريبية', 'Tax Period')}</th>
+                  <th className="py-2.5 px-3.5 text-end font-semibold">{t(lang, 'وعاء المبيعات الصافي', 'Net Sales')}</th>
+                  <th className="py-2.5 px-3.5 text-end font-semibold">{t(lang, 'المخرجات (2201)', 'Output (2201)')}</th>
+                  <th className="py-2.5 px-3.5 text-end font-semibold">{t(lang, 'مدخلات مخصومة (1105)', 'Deductible (1105)')}</th>
+                  <th className="py-2.5 px-3.5 text-end font-semibold">{t(lang, 'مدخلات غير مخصومة', 'Non-Deductible')}</th>
+                  <th className="py-2.5 px-3.5 text-end font-semibold">{t(lang, 'إجمالي المدخلات', 'Total Incurred')}</th>
+                  <th className="py-2.5 px-3.5 text-end font-semibold">{t(lang, 'نسبة الخصم %', 'Deduct %')}</th>
+                  <th className="py-2.5 px-3.5 text-end font-semibold">{t(lang, 'صافي المستحق (ETA)', 'Net Payable (ETA)')}</th>
+                  <th className="py-2.5 px-3.5 text-end font-semibold">{t(lang, 'التغير %', 'MoM %')}</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                 {vatSummary.monthlyBreakdown.map((row) => (
                   <tr key={row.key} className="hover:bg-slate-50 dark:hover:bg-slate-800/40">
-                    <td className="py-2.5 px-4 font-medium text-slate-900 dark:text-slate-100">
+                    <td className="py-2.5 px-3.5 font-medium text-slate-900 dark:text-slate-100 whitespace-nowrap">
                       {lang === 'ar' ? row.labelAr : row.labelEn}
                     </td>
-                    <td className="py-2.5 px-4 text-end font-mono-num text-slate-600 dark:text-slate-300" dir="ltr">
+                    <td className="py-2.5 px-3.5 text-end font-mono-num text-slate-600 dark:text-slate-300" dir="ltr">
                       {fmtMoney(row.netSales, 0)}
                     </td>
-                    <td className="py-2.5 px-4 text-end font-mono-num font-semibold text-slate-900 dark:text-slate-100" dir="ltr">
+                    <td className="py-2.5 px-3.5 text-end font-mono-num font-semibold text-slate-900 dark:text-slate-100" dir="ltr">
                       {fmtMoney(row.outputVat, 2)}
                     </td>
-                    <td className="py-2.5 px-4 text-end font-mono-num text-slate-600 dark:text-slate-300" dir="ltr">
-                      {fmtMoney(row.purchasesNet, 0)}
+                    <td className="py-2.5 px-3.5 text-end font-mono-num font-semibold text-emerald-700 dark:text-emerald-400" dir="ltr">
+                      -{fmtMoney(row.deductibleInputVat, 2)}
                     </td>
-                    <td className="py-2.5 px-4 text-end font-mono-num text-emerald-700 dark:text-emerald-400" dir="ltr">
-                      -{fmtMoney(row.inputVat, 2)}
+                    <td className="py-2.5 px-3.5 text-end font-mono-num font-semibold text-amber-700 dark:text-amber-400" dir="ltr">
+                      {fmtMoney(row.nonDeductibleInputVat, 2)}
                     </td>
-                    <td className="py-2.5 px-4 text-end font-mono-num text-slate-700 dark:text-slate-300" dir="ltr">
-                      {fmtPct(row.offsetPct, 1)}
+                    <td className="py-2.5 px-3.5 text-end font-mono-num text-slate-700 dark:text-slate-300" dir="ltr">
+                      {fmtMoney(row.totalInputVatIncurred, 2)}
                     </td>
-                    <td className="py-2.5 px-4 text-end font-mono-num font-bold text-teal-800 dark:text-teal-300" dir="ltr">
-                      {fmtMoney(row.netPayable, 2)} {t(lang, 'ج.م', 'EGP')}
+                    <td className="py-2.5 px-3.5 text-end font-mono-num text-slate-700 dark:text-slate-300" dir="ltr">
+                      {fmtPct(row.deductibilityPct, 1)}
                     </td>
-                    <td className="py-2.5 px-4 text-end font-mono-num" dir="ltr">
+                    <td className="py-2.5 px-3.5 text-end font-mono-num font-bold text-teal-800 dark:text-teal-300" dir="ltr">
+                      {fmtMoney(row.netPayable, 2)}
+                    </td>
+                    <td className="py-2.5 px-3.5 text-end font-mono-num" dir="ltr">
                       {row.momDeltaPct === null ? (
                         <span className="text-slate-400">—</span>
                       ) : (
@@ -2409,35 +2961,196 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
                   </tr>
                 ))}
                 <tr className="bg-slate-50/90 dark:bg-slate-800/70 font-bold border-t border-slate-200 dark:border-slate-700">
-                  <td className="py-2.5 px-4 text-slate-900 dark:text-slate-100">
+                  <td className="py-2.5 px-3.5 text-slate-900 dark:text-slate-100">
                     {t(lang, 'إجمالي الفترة المحددة', 'Selected Period Total')}
                   </td>
-                  <td className="py-2.5 px-4 text-end font-mono-num text-slate-800 dark:text-slate-200" dir="ltr">
+                  <td className="py-2.5 px-3.5 text-end font-mono-num text-slate-800 dark:text-slate-200" dir="ltr">
                     {fmtMoney(metrics.net, 0)}
                   </td>
-                  <td className="py-2.5 px-4 text-end font-mono-num text-slate-900 dark:text-slate-100" dir="ltr">
+                  <td className="py-2.5 px-3.5 text-end font-mono-num text-slate-900 dark:text-slate-100" dir="ltr">
                     {fmtMoney(vatSummary.outputVat, 2)}
                   </td>
-                  <td className="py-2.5 px-4 text-end font-mono-num text-slate-800 dark:text-slate-200" dir="ltr">
-                    {fmtMoney(vatSummary.taxablePurchasesBase, 0)}
+                  <td className="py-2.5 px-3.5 text-end font-mono-num text-emerald-700 dark:text-emerald-400" dir="ltr">
+                    -{fmtMoney(vatSummary.deductibleInputVat, 2)}
                   </td>
-                  <td className="py-2.5 px-4 text-end font-mono-num text-emerald-700 dark:text-emerald-400" dir="ltr">
-                    -{fmtMoney(vatSummary.inputVat, 2)}
+                  <td className="py-2.5 px-3.5 text-end font-mono-num text-amber-700 dark:text-amber-400" dir="ltr">
+                    {fmtMoney(vatSummary.nonDeductibleInputVat, 2)}
                   </td>
-                  <td className="py-2.5 px-4 text-end font-mono-num text-slate-800 dark:text-slate-200" dir="ltr">
-                    {fmtPct(vatSummary.recoveryRatioPct, 1)}
+                  <td className="py-2.5 px-3.5 text-end font-mono-num text-slate-800 dark:text-slate-200" dir="ltr">
+                    {fmtMoney(vatSummary.totalInputVatIncurred, 2)}
                   </td>
-                  <td className="py-2.5 px-4 text-end font-mono-num text-teal-800 dark:text-teal-300" dir="ltr">
+                  <td className="py-2.5 px-3.5 text-end font-mono-num text-slate-800 dark:text-slate-200" dir="ltr">
+                    {fmtPct(vatSummary.deductibilityRatioPct, 1)}
+                  </td>
+                  <td className="py-2.5 px-3.5 text-end font-mono-num text-teal-800 dark:text-teal-300" dir="ltr">
                     {fmtMoney(vatSummary.netVatPayable, 2)} {t(lang, 'ج.م', 'EGP')}
                   </td>
-                  <td className="py-2.5 px-4 text-end text-slate-400">—</td>
+                  <td className="py-2.5 px-3.5 text-end text-slate-400">—</td>
                 </tr>
               </tbody>
             </table>
           </div>
         )}
 
-        {/* View 3: Output vs Input Invoice Sources & GL Reconciliation */}
+        {/* View 3: ETA Compliance & Input VAT Deductibility Audit View */}
+        {vatViewMode === 'audit' && (
+          <div className="border-t border-slate-200 dark:border-slate-800">
+            <div className="px-5 py-3.5 bg-slate-50/60 dark:bg-slate-800/30 border-b border-slate-200 dark:border-slate-800 flex flex-col lg:flex-row lg:items-center justify-between gap-2">
+              <div>
+                <h3 className="text-xs font-bold text-slate-900 dark:text-slate-100">
+                  {t(
+                    lang,
+                    'مصفوفة الفحص الضريبي لمدخلات القيمة المضافة — التوافق مع قانون 67 لسنة 2016 ومنظومة الفاتورة الإلكترونية (ETA)',
+                    'ETA Input VAT Deductibility Audit Matrix — Law No. 67/2016 & e-Invoicing Compliance'
+                  )}
+                </h3>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                  {t(
+                    lang,
+                    'تصنيف كل تدفقات المشتريات والمصروفات بين الضريبة القابلة للخصم في نموذج 10 (حساب 1105) والضريبة المحملة على التكلفة (5101 / 5301) والتدفقات المعفاة.',
+                    'Classifies all procurement & operating outflows into ETA Form 10 creditable Input VAT (Acc 1105), disallowed/absorbed P&L VAT (5101/5301), and exempt schedules.'
+                  )}
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-3 text-xs font-mono-num shrink-0" dir="ltr">
+                <span className="text-emerald-700 dark:text-emerald-400 font-bold">
+                  {t(lang, 'مخصوم:', 'Deductible:')} {fmtMoney(vatSummary.deductibleInputVat, 2)}
+                </span>
+                <span aria-hidden="true" className="text-slate-300 dark:text-slate-600">·</span>
+                <span className="text-amber-700 dark:text-amber-400 font-bold">
+                  {t(lang, 'غير مخصوم:', 'Non-Deductible:')} {fmtMoney(vatSummary.nonDeductibleInputVat, 2)}
+                </span>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="bg-slate-50 dark:bg-slate-800/80 border-b border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300">
+                    <th className="py-2.5 px-4 text-start font-semibold">{t(lang, 'البند الضريبي والمعالجة المحاسبية', 'Tax Bucket & Treatment')}</th>
+                    <th className="py-2.5 px-4 text-start font-semibold">{t(lang, 'السند القانوني ETA', 'ETA Statutory Basis')}</th>
+                    <th className="py-2.5 px-4 text-center font-semibold">{t(lang, 'حساب الأستاذ', 'GL Account')}</th>
+                    <th className="py-2.5 px-4 text-end font-semibold">{t(lang, 'الوعاء الصافي (ج.م)', 'Base Amount')}</th>
+                    <th className="py-2.5 px-4 text-end font-semibold">{t(lang, 'ضريبة مخصومة (1105)', 'Deductible VAT')}</th>
+                    <th className="py-2.5 px-4 text-end font-semibold">{t(lang, 'ضريبة غير مخصومة', 'Non-Deductible VAT')}</th>
+                    <th className="py-2.5 px-4 text-start font-semibold">{t(lang, 'حالة الفحص', 'Audit Classification')}</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {vatSummary.etaAuditBuckets.map((bucket) => (
+                    <tr key={bucket.id} className="hover:bg-slate-50 dark:hover:bg-slate-800/40 align-top">
+                      <td className="py-3 px-4">
+                        <div className="font-semibold text-slate-900 dark:text-slate-100">
+                          {lang === 'ar' ? bucket.titleAr : bucket.titleEn}
+                        </div>
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                          {lang === 'ar' ? bucket.auditNoteAr : bucket.auditNoteEn}
+                        </div>
+                      </td>
+                      <td className="py-3 px-4 text-[11px] text-slate-600 dark:text-slate-300 whitespace-nowrap">
+                        {lang === 'ar' ? bucket.etaRefAr : bucket.etaRefEn}
+                      </td>
+                      <td className="py-3 px-4 text-center font-mono-num font-semibold text-slate-700 dark:text-slate-200" dir="ltr">
+                        {bucket.glAccount}
+                      </td>
+                      <td className="py-3 px-4 text-end font-mono-num text-slate-800 dark:text-slate-200" dir="ltr">
+                        {fmtMoney(bucket.baseAmount, 0)}
+                      </td>
+                      <td className="py-3 px-4 text-end font-mono-num font-bold text-emerald-700 dark:text-emerald-400" dir="ltr">
+                        {bucket.deductibleVat > 0 ? `-${fmtMoney(bucket.deductibleVat, 2)}` : '—'}
+                      </td>
+                      <td className="py-3 px-4 text-end font-mono-num font-bold text-amber-700 dark:text-amber-400" dir="ltr">
+                        {bucket.nonDeductibleVat > 0 ? fmtMoney(bucket.nonDeductibleVat, 2) : '—'}
+                      </td>
+                      <td className="py-3 px-4 whitespace-nowrap text-[11px] font-semibold">
+                        {bucket.treatment === 'deductible' && (
+                          <span className="text-emerald-700 dark:text-emerald-400">
+                            {t(lang, 'مقبول بالخصم — نموذج 10', 'Creditable (Form 10)')}
+                          </span>
+                        )}
+                        {bucket.treatment === 'non_deductible' && (
+                          <span className="text-amber-700 dark:text-amber-400">
+                            {t(lang, 'مرفوض الخصم — محمل P&L', 'Disallowed (P&L Cost)')}
+                          </span>
+                        )}
+                        {bucket.treatment === 'exempt_out_of_scope' && (
+                          <span className="text-slate-600 dark:text-slate-300">
+                            {t(lang, 'معفى / خارج نطاق VAT', 'Exempt / Out-of-Scope')}
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                  <tr className="bg-slate-50/90 dark:bg-slate-800/70 font-bold border-t border-slate-200 dark:border-slate-700">
+                    <td colSpan={3} className="py-3 px-4 text-slate-900 dark:text-slate-100">
+                      {t(lang, 'إجمالي مطابقة ضريبة المدخلات والوعاء الكلي للفترة', 'Total Input VAT Audit Reconciliation')}
+                    </td>
+                    <td className="py-3 px-4 text-end font-mono-num text-slate-900 dark:text-slate-100" dir="ltr">
+                      {fmtMoney(
+                        round2(
+                          vatSummary.taxablePurchasesBase +
+                            vatSummary.nonDeductiblePurchasesBase +
+                            vatSummary.exemptOutOfScopeBase
+                        ),
+                        0
+                      )}
+                    </td>
+                    <td className="py-3 px-4 text-end font-mono-num text-emerald-700 dark:text-emerald-400" dir="ltr">
+                      -{fmtMoney(vatSummary.deductibleInputVat, 2)}
+                    </td>
+                    <td className="py-3 px-4 text-end font-mono-num text-amber-700 dark:text-amber-400" dir="ltr">
+                      {fmtMoney(vatSummary.nonDeductibleInputVat, 2)}
+                    </td>
+                    <td className="py-3 px-4 font-mono-num text-slate-800 dark:text-slate-200" dir="ltr">
+                      {fmtPct(vatSummary.deductibilityRatioPct, 1)} {t(lang, 'استرداد', 'recov.')}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            {/* Tax Shield Optimization & Exempt Base Footnote */}
+            <div className="p-4 border-t border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/20 grid grid-cols-1 lg:grid-cols-2 gap-4 text-xs">
+              <div className="p-3.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 space-y-1.5">
+                <div className="font-bold text-slate-900 dark:text-slate-100">
+                  {t(lang, 'توصية التحسين الضريبي للمدير المالي (CFO Tax Shield Action)', 'CFO Tax-Shield Recovery Opportunity')}
+                </div>
+                <p className="text-slate-600 dark:text-slate-300 leading-relaxed">
+                  {t(
+                    lang,
+                    `تتكبد الشركة حالياً ${fmtMoney(vatSummary.nonDeductibleInputVat, 2)} ج.م كضريبة مدخلات غير قابلة للخصم (${fmtMoney(vatSummary.nonDeductibleCogsVat, 0)} ج.م خامات بدون فاتورة إلكترونية + ${fmtMoney(vatSummary.nonDeductibleOpexVat, 0)} ج.م مصروفات 5301). تحويل موردي الخضروات والصيانة لإصدار فواتير ETA B2B يخفض صافي السداد الضريبي من ${fmtMoney(vatSummary.netVatPayable, 0)} ج.م إلى ${fmtMoney(vatSummary.hypotheticalNetPayableIfAllDeductible, 0)} ج.م.`,
+                    `Estadat currently absorbs ${fmtMoney(vatSummary.nonDeductibleInputVat, 2)} EGP in non-deductible input VAT (${fmtMoney(vatSummary.nonDeductibleCogsVat, 0)} EGP uninvoiced COGS + ${fmtMoney(vatSummary.nonDeductibleOpexVat, 0)} EGP gross 5301 OpEx). Migrating produce & maintenance vendors to ETA B2B e-invoices could lower net ETA payable from ${fmtMoney(vatSummary.netVatPayable, 0)} to ${fmtMoney(vatSummary.hypotheticalNetPayableIfAllDeductible, 0)} EGP.`
+                  )}
+                </p>
+              </div>
+              <div className="p-3.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 space-y-1.5">
+                <div className="font-bold text-slate-900 dark:text-slate-100">
+                  {t(lang, 'تفصيل البنود المعفاة وخارج نطاق VAT (للإقرار)', 'Exempt & Out-of-Scope Outflow Breakdown')}
+                </div>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[11px] text-slate-600 dark:text-slate-300">
+                  <div className="flex justify-between">
+                    <span>{t(lang, 'رواتب ومنح (5201)', 'Payroll (5201)')}</span>
+                    <span className="font-mono-num font-semibold" dir="ltr">{fmtMoney(vatSummary.exemptPayrollBase, 0)}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>{t(lang, 'حق الانتفاع (5202)', 'Usufruct (5202)')}</span>
+                    <span className="font-mono-num font-semibold" dir="ltr">{fmtMoney(vatSummary.exemptUsufructBase, 0)}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>{t(lang, 'كهرباء ومرافق (0% مخصوم)', 'Electricity (0% Credit)')}</span>
+                    <span className="font-mono-num font-semibold" dir="ltr">{fmtMoney(vatSummary.exemptUtilitiesBase, 0)}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>{t(lang, 'عمولات بنكية معفاة (5308)', 'Bank Fees Exempt (5308)')}</span>
+                    <span className="font-mono-num font-semibold" dir="ltr">{fmtMoney(vatSummary.exemptBankFeesBase, 0)}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* View 4: Output vs Input Invoice Sources & GL Reconciliation */}
         {vatViewMode === 'sources' && (
           <div className="grid grid-cols-1 lg:grid-cols-2 divide-y lg:divide-y-0 lg:divide-x lg:rtl:divide-x-reverse divide-slate-200 dark:divide-slate-800 border-t border-slate-200 dark:border-slate-800">
             {/* Sales Output VAT Sources */}
@@ -2487,29 +3200,29 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
               </div>
             </div>
 
-            {/* Purchases Input VAT Sources */}
+            {/* Purchases Input VAT Sources (Deductible 1105 + Non-Deductible Disallowed) */}
             <div className="p-5 space-y-3">
               <div className="flex items-center justify-between">
                 <h3 className="text-xs font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
                   <ArrowLeftRight className="w-4 h-4 text-emerald-700 dark:text-emerald-400" />
-                  <span>{t(lang, 'مصادر ضريبة المدخلات (المشتريات — Acc 1105)', 'Input VAT Sources (Purchases — Acc 1105)')}</span>
+                  <span>{t(lang, 'مصادر ضريبة المدخلات (المخصومة 1105 وغير المخصومة)', 'Input VAT Sources (Deductible 1105 & Non-Deductible)')}</span>
                 </h3>
                 <span className="font-mono-num text-xs font-bold text-emerald-700 dark:text-emerald-400" dir="ltr">
-                  -{fmtMoney(vatSummary.inputVat, 2)} EGP
+                  -{fmtMoney(vatSummary.deductibleInputVat, 2)} / +{fmtMoney(vatSummary.nonDeductibleInputVat, 2)}
                 </span>
               </div>
               <div className="divide-y divide-slate-100 dark:divide-slate-800 border border-slate-200 dark:border-slate-800 rounded-lg text-xs">
                 <div className="px-3.5 py-2.5 flex items-center justify-between">
                   <span className="text-slate-600 dark:text-slate-300">
-                    {t(lang, 'مدخلات الفترة الأساسية المخصومة (موردون)', 'Audited Base Purchase Input VAT')}
+                    {t(lang, 'مدخلات مخصومة — فواتير موردين أساسية (Acc 1105)', 'Deductible Base Purchase Input VAT (Acc 1105)')}
                   </span>
                   <span className="font-mono-num font-semibold text-emerald-700 dark:text-emerald-400" dir="ltr">
-                    {fmtMoney(round2(vatSummary.inputVat - (period === '9m_plus_live' ? vatSummary.livePurchaseVat + vatSummary.liveExpenseVat : 0)), 2)}
+                    -{fmtMoney(round2(vatSummary.deductibleInputVat - (period === '9m_plus_live' ? vatSummary.livePurchaseVat + vatSummary.liveExpenseVat : 0)), 2)}
                   </span>
                 </div>
                 <div className="px-3.5 py-2.5 flex items-center justify-between">
                   <span className="text-slate-600 dark:text-slate-300">
-                    {t(lang, `ضريبة فواتير المشتريات المباشرة (${vatSummary.livePurchasesCount})`, `Live Supplier PO VAT (${vatSummary.livePurchasesCount})`)}
+                    {t(lang, `مدخلات مخصومة — مشتريات ومصروفات مباشرة (${vatSummary.livePurchasesCount + vatSummary.liveTaxableExpensesCount})`, `Live Deductible PO & OpEx VAT (${vatSummary.livePurchasesCount + vatSummary.liveTaxableExpensesCount})`)}
                     {vatSummary.seededPurchaseVat > 0 && (
                       <span className="text-[11px] text-slate-400 ms-1" dir="ltr">
                         (+{fmtMoney(vatSummary.seededPurchaseVat, 0)} PO-SEED)
@@ -2517,20 +3230,28 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
                     )}
                   </span>
                   <span className="font-mono-num font-semibold text-emerald-700 dark:text-emerald-400" dir="ltr">
-                    {fmtMoney(vatSummary.livePurchaseVat, 2)}
+                    -{fmtMoney(round2(vatSummary.livePurchaseVat + vatSummary.liveExpenseVat), 2)}
                   </span>
                 </div>
                 <div className="px-3.5 py-2.5 flex items-center justify-between">
-                  <span className="text-slate-600 dark:text-slate-300">
-                    {t(lang, 'ضريبة مدخلات المصروفات التشغيلية المباشرة', 'Live Taxable Operating Expenses VAT')}
+                  <span className="text-amber-800 dark:text-amber-300">
+                    {t(lang, 'غير مخصوم — مشتريات خامات بدون فاتورة إلكترونية (5101)', 'Non-Deductible — Uninvoiced COGS Purchases (5101)')}
                   </span>
-                  <span className="font-mono-num font-semibold text-emerald-700 dark:text-emerald-400" dir="ltr">
-                    {fmtMoney(vatSummary.liveExpenseVat, 2)}
+                  <span className="font-mono-num font-semibold text-amber-700 dark:text-amber-400" dir="ltr">
+                    {fmtMoney(vatSummary.nonDeductibleCogsVat, 2)}
+                  </span>
+                </div>
+                <div className="px-3.5 py-2.5 flex items-center justify-between">
+                  <span className="text-amber-800 dark:text-amber-300">
+                    {t(lang, 'غير مخصوم — ضريبة ضمنية بمصروفات 5301 (Art. 22)', 'Non-Deductible — Gross 5301 OpEx Embedded VAT')}
+                  </span>
+                  <span className="font-mono-num font-semibold text-amber-700 dark:text-amber-400" dir="ltr">
+                    {fmtMoney(vatSummary.nonDeductibleOpexVat, 2)}
                   </span>
                 </div>
                 <div className="px-3.5 py-2.5 flex items-center justify-between bg-slate-50/70 dark:bg-slate-800/40">
                   <span className="font-medium text-slate-700 dark:text-slate-200">
-                    {t(lang, 'رصيد حساب 1105 بدفتر الأستاذ التراكمي', 'Cumulative GL Account 1105 Balance')}
+                    {t(lang, 'رصيد حساب 1105 المخصوم بدفتر الأستاذ التراكمي', 'Cumulative GL Account 1105 (Deductible Balance)')}
                   </span>
                   <span className="font-mono-num font-bold text-emerald-700 dark:text-emerald-400" dir="ltr">
                     {fmtMoney(vatSummary.ledgerInput1105, 2)}
@@ -2540,6 +3261,336 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
             </div>
           </div>
         )}
+      </section>
+
+      {/* Automated MoM Revenue Growth Monitor (< 5% for 2+ Consecutive Months) */}
+      <section
+        id="revenue-growth-alerts"
+        className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden"
+      >
+        <div className="px-5 py-4 border-b border-slate-200 dark:border-slate-800 flex flex-col xl:flex-row xl:items-center justify-between gap-4 bg-slate-50/70 dark:bg-slate-800/40">
+          <div className="flex items-start gap-3">
+            <div
+              className={`p-2 rounded-lg border shrink-0 ${
+                revenueGrowthMonitor.triggered
+                  ? 'bg-red-50 dark:bg-red-950/60 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
+                  : 'bg-emerald-50 dark:bg-emerald-950/60 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300'
+              }`}
+            >
+              <TrendingDown className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                  {t(
+                    lang,
+                    'المراقب التلقائي لنمو الإيرادات الشهري (تنبيه < 5% لشهرين متتاليين)',
+                    'Automated MoM Revenue Growth Alert Monitor (< 5% Consecutive Check)'
+                  )}
+                </h2>
+                <span
+                  className={`px-2 py-0.5 rounded border text-[11px] font-bold font-mono-num ${
+                    revenueGrowthMonitor.triggered
+                      ? 'bg-red-50 dark:bg-red-950/60 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
+                      : 'bg-emerald-50 dark:bg-emerald-950/60 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300'
+                  }`}
+                  dir="ltr"
+                >
+                  {revenueGrowthMonitor.triggered
+                    ? `${revenueGrowthMonitor.streaks.length} Streak(s) · Max ${revenueGrowthMonitor.maxConsecutiveStreak}m`
+                    : 'Healthy ≥ 5% MoM'}
+                </span>
+              </div>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                {t(
+                  lang,
+                  `يفحص معدل نمو صافي الإيراد شهراً بشهر عبر البيانات المراجعة ويُطلق إشعاراً تلقائياً عند انخفاض النمو عن +${revGrowthThresholdPct}% لمدة ${revConsecutiveTarget} شهور متتالية أو أكثر مع رابط مباشر لوحدة مراجعة الأداء.`,
+                  `Continuously evaluates audited month-over-month net revenue growth and triggers an automated alert whenever growth stays below +${revGrowthThresholdPct}% for ${revConsecutiveTarget}+ consecutive months, linking directly to Performance Review.`
+                )}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <label className="flex items-center gap-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg px-2.5 py-1.5">
+              <span className="text-slate-500 dark:text-slate-400">{t(lang, 'الحد الأدنى MoM', 'Min MoM')}</span>
+              <select
+                value={revGrowthThresholdPct}
+                onChange={(e) => setRevGrowthThresholdPct(Number(e.target.value))}
+                className="font-mono-num font-bold text-slate-900 dark:text-slate-100 bg-transparent outline-none cursor-pointer"
+                dir="ltr"
+              >
+                <option value={3}>+3%</option>
+                <option value={5}>+5%</option>
+                <option value={8}>+8%</option>
+                <option value={10}>+10%</option>
+              </select>
+            </label>
+
+            <label className="flex items-center gap-1.5 text-xs bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg px-2.5 py-1.5">
+              <span className="text-slate-500 dark:text-slate-400">{t(lang, 'شهور متتالية', 'Streak')}</span>
+              <select
+                value={revConsecutiveTarget}
+                onChange={(e) => setRevConsecutiveTarget(Number(e.target.value))}
+                className="font-mono-num font-bold text-slate-900 dark:text-slate-100 bg-transparent outline-none cursor-pointer"
+                dir="ltr"
+              >
+                <option value={2}>2+ mo</option>
+                <option value={3}>3+ mo</option>
+                <option value={4}>4+ mo</option>
+              </select>
+            </label>
+
+            <button
+              type="button"
+              onClick={() => setShowRevGrowthNotifLog(!showRevGrowthNotifLog)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 cursor-pointer"
+            >
+              <BellRing className="w-3.5 h-3.5 text-red-600" />
+              <span>{t(lang, 'سجل الإشعارات', 'Alert Log')}</span>
+              {unreadRevGrowthNotifCount > 0 && (
+                <span className="px-1.5 py-0.5 rounded-full bg-red-600 text-white text-[10px] font-mono-num">
+                  {unreadRevGrowthNotifCount}
+                </span>
+              )}
+            </button>
+
+            {revenueGrowthMonitor.triggered && (
+              <button
+                type="button"
+                onClick={() => dispatchRevenueGrowthNotification('manual_dispatch')}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/50 text-red-700 dark:text-red-300 hover:bg-red-100 cursor-pointer"
+              >
+                <Send className="w-3.5 h-3.5" />
+                <span>{t(lang, 'إعادة إرسال التنبيه', 'Dispatch Alert')}</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={openPerformanceReviewDrilldown}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 hover:opacity-90 cursor-pointer"
+            >
+              <span>{t(lang, 'الانتقال لوحدة مراجعة الأداء', 'Open Performance Review')}</span>
+              <ArrowUpRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+
+        {/* Summary KPI Strip */}
+        <div className="grid grid-cols-2 lg:grid-cols-4 divide-y lg:divide-y-0 lg:divide-x lg:rtl:divide-x-reverse divide-slate-200 dark:divide-slate-800 border-b border-slate-200 dark:border-slate-800">
+          <div className="px-5 py-3">
+            <div className="text-[11px] text-slate-500 dark:text-slate-400">
+              {t(lang, 'موجات التباطؤ المرصودة (≥ شهرين)', 'Triggered Streaks (2+ Consecutive Mos)')}
+            </div>
+            <div className={`text-lg font-bold font-mono-num mt-0.5 ${revenueGrowthMonitor.triggered ? 'text-red-700 dark:text-red-400' : 'text-emerald-700 dark:text-emerald-400'}`} dir="ltr">
+              {revenueGrowthMonitor.streaks.length} {t(lang, 'موجات', 'Streak(s)')}
+            </div>
+          </div>
+          <div className="px-5 py-3">
+            <div className="text-[11px] text-slate-500 dark:text-slate-400">
+              {t(lang, 'أحدث موجة تباطؤ متتالية', 'Latest Consecutive Slowdown')}
+            </div>
+            <div className="text-sm font-bold text-slate-900 dark:text-slate-100 mt-1">
+              {revenueGrowthMonitor.latestStreak
+                ? `${lang === 'ar' ? revenueGrowthMonitor.latestStreak.rangeLabelAr : revenueGrowthMonitor.latestStreak.rangeLabelEn} (${revenueGrowthMonitor.latestStreak.length}m)`
+                : t(lang, 'لا يوجد تباطؤ متتالي', 'None Detected')}
+            </div>
+          </div>
+          <div className="px-5 py-3">
+            <div className="text-[11px] text-slate-500 dark:text-slate-400">
+              {t(lang, `إجمالي الشهور < +${revGrowthThresholdPct}%`, `Total Months < +${revGrowthThresholdPct}% MoM`)}
+            </div>
+            <div className="text-lg font-bold font-mono-num text-amber-700 dark:text-amber-400 mt-0.5" dir="ltr">
+              {revenueGrowthMonitor.belowMonthsCount} / {Math.max(0, revenueGrowthMonitor.evaluatedMonths.length - 1)}
+            </div>
+          </div>
+          <div className="px-5 py-3 flex items-center justify-between gap-2">
+            <div>
+              <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                {t(lang, 'أقصى سلسلة انخفاض متتالية', 'Longest Streak Below Target')}
+              </div>
+              <div className="text-lg font-bold font-mono-num text-slate-900 dark:text-slate-100 mt-0.5" dir="ltr">
+                {revenueGrowthMonitor.maxConsecutiveStreak} {t(lang, 'شهور', 'Months')}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={openPerformanceReviewDrilldown}
+              className="text-xs font-bold text-teal-700 dark:text-teal-400 hover:underline inline-flex items-center gap-1 cursor-pointer shrink-0"
+            >
+              <span>{t(lang, 'التفاصيل', 'Drill Down')}</span>
+              <ArrowUpRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+
+        {/* Collapsible Revenue Growth Alert Dispatch Log */}
+        {showRevGrowthNotifLog && (
+          <div className="px-5 py-4 bg-slate-50/80 dark:bg-slate-800/40 border-b border-slate-200 dark:border-slate-800 space-y-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-xs font-bold text-slate-800 dark:text-slate-200">
+                {t(lang, 'سجل تنبيهات تباطؤ نمو الإيرادات التلقائية', 'Automated Revenue Slowdown Alert Dispatch Log')}
+              </div>
+              {unreadRevGrowthNotifCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const updated = revGrowthNotifications.map((n) => ({ ...n, acknowledged: true }));
+                    setRevGrowthNotifications(updated);
+                    saveRevGrowthNotificationsToStorage(updated);
+                    setActiveRevGrowthToast(null);
+                  }}
+                  className="text-[11px] font-semibold text-teal-700 dark:text-teal-400 hover:underline cursor-pointer"
+                >
+                  {t(lang, 'تحديد الكل كمقروء', 'Mark All Acknowledged')}
+                </button>
+              )}
+            </div>
+            {revGrowthNotifications.length === 0 ? (
+              <div className="text-xs text-slate-500 py-2">
+                {t(lang, 'لا توجد تنبيهات مسجلة حتى الآن.', 'No alerts dispatched yet.')}
+              </div>
+            ) : (
+              <div className="space-y-2 max-h-52 overflow-y-auto">
+                {revGrowthNotifications.map((n) => (
+                  <div
+                    key={n.id}
+                    className={`p-3 rounded-lg border text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 ${
+                      n.acknowledged
+                        ? 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
+                        : 'bg-red-50/70 dark:bg-red-950/35 border-red-200 dark:border-red-800 text-slate-900 dark:text-slate-100'
+                    }`}
+                  >
+                    <div className="space-y-0.5">
+                      <div className="font-bold flex flex-wrap items-center gap-2">
+                        <span>{lang === 'ar' ? n.titleAr : n.titleEn}</span>
+                        <span className="font-mono-num text-[10px] text-slate-500" dir="ltr">{n.createdAt}</span>
+                      </div>
+                      <div className="text-[11px] opacity-90">{lang === 'ar' ? n.messageAr : n.messageEn}</div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={openPerformanceReviewDrilldown}
+                        className="px-2.5 py-1 rounded bg-red-700 text-white text-[11px] font-semibold hover:bg-red-800 cursor-pointer"
+                      >
+                        {t(lang, 'مراجعة الأداء', 'Performance Review')}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Monthly MoM Revenue Growth Audit Strip */}
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="bg-slate-50 dark:bg-slate-800/60 border-b border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300">
+                <th className="py-2.5 px-4 text-start font-semibold">{t(lang, 'الشهر', 'Month')}</th>
+                <th className="py-2.5 px-4 text-end font-semibold">{t(lang, 'صافي الإيراد (Ex-VAT)', 'Net Revenue')}</th>
+                <th className="py-2.5 px-4 text-end font-semibold">{t(lang, 'التغير الشهري (ج.م)', 'MoM Delta (EGP)')}</th>
+                <th className="py-2.5 px-4 text-end font-semibold">{t(lang, 'نسبة النمو MoM %', 'MoM Growth %')}</th>
+                <th className="py-2.5 px-4 text-center font-semibold">{t(lang, 'التسلسل < الحد', 'Consecutive Streak')}</th>
+                <th className="py-2.5 px-4 text-end font-semibold">{t(lang, 'حالة التنبيه', 'Alert Status')}</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+              {revenueGrowthMonitor.evaluatedMonths.map((row) => {
+                const isTriggered = row.isConsecutiveTriggerMonth;
+                const isSingleBelow = row.isBelowThreshold && !isTriggered;
+                return (
+                  <tr
+                    key={row.month}
+                    className={
+                      isTriggered
+                        ? 'bg-red-50/45 dark:bg-red-950/20 hover:bg-red-50/70'
+                        : 'hover:bg-slate-50/70 dark:hover:bg-slate-800/30'
+                    }
+                  >
+                    <td className="py-2.5 px-4 font-semibold text-slate-900 dark:text-slate-100">
+                      {lang === 'ar' ? row.monthLabelAr : row.monthLabelEn}
+                    </td>
+                    <td className="py-2.5 px-4 text-end font-mono-num text-slate-800 dark:text-slate-200" dir="ltr">
+                      {fmtMoney(row.netRevenue, 0)} EGP
+                    </td>
+                    <td
+                      className={`py-2.5 px-4 text-end font-mono-num font-medium ${
+                        row.deltaNetEgp === null
+                          ? 'text-slate-400'
+                          : row.deltaNetEgp >= 0
+                          ? 'text-emerald-700 dark:text-emerald-400'
+                          : 'text-red-700 dark:text-red-400'
+                      }`}
+                      dir="ltr"
+                    >
+                      {row.deltaNetEgp === null
+                        ? '—'
+                        : `${row.deltaNetEgp >= 0 ? '+' : ''}${fmtMoney(row.deltaNetEgp, 0)}`}
+                    </td>
+                    <td
+                      className={`py-2.5 px-4 text-end font-mono-num font-bold ${
+                        row.revMomPct === null
+                          ? 'text-slate-400'
+                          : row.isBelowThreshold
+                          ? 'text-red-700 dark:text-red-400'
+                          : 'text-emerald-700 dark:text-emerald-400'
+                      }`}
+                      dir="ltr"
+                    >
+                      {row.revMomPct === null
+                        ? 'Base'
+                        : `${row.revMomPct >= 0 ? '+' : ''}${row.revMomPct.toFixed(1)}%`}
+                    </td>
+                    <td className="py-2.5 px-4 text-center font-mono-num" dir="ltr">
+                      {row.revMomPct === null ? (
+                        <span className="text-slate-400">—</span>
+                      ) : row.consecutiveBelowCount > 0 ? (
+                        <span
+                          className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-bold border ${
+                            isTriggered
+                              ? 'bg-red-100 dark:bg-red-900/50 border-red-300 dark:border-red-700 text-red-800 dark:text-red-200'
+                              : 'bg-amber-50 dark:bg-amber-950/50 border-amber-200 dark:border-amber-700 text-amber-800 dark:text-amber-300'
+                          }`}
+                        >
+                          #{row.consecutiveBelowCount} {t(lang, 'شهر', 'mo')}
+                        </span>
+                      ) : (
+                        <span className="text-emerald-700 dark:text-emerald-400 font-semibold">0</span>
+                      )}
+                    </td>
+                    <td className="py-2.5 px-4 text-end">
+                      {row.revMomPct === null ? (
+                        <span className="text-[11px] text-slate-400">{t(lang, 'شهر الأساس', 'Baseline')}</span>
+                      ) : isTriggered ? (
+                        <button
+                          type="button"
+                          onClick={openPerformanceReviewDrilldown}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-red-600 hover:bg-red-700 text-white text-[11px] font-semibold cursor-pointer transition-colors"
+                        >
+                          <span>{t(lang, 'تنبيه متتالي · مراجعة الأداء', 'Consecutive Alert · Review')}</span>
+                          <ArrowUpRight className="w-3 h-3" />
+                        </button>
+                      ) : isSingleBelow ? (
+                        <span className="inline-flex items-center px-2 py-0.5 rounded border border-amber-200 bg-amber-50 text-amber-800 text-[11px] font-semibold">
+                          {t(lang, 'شهر أول < الحد (مراقبة)', '1st Mo < Limit (Watch)')}
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-400">
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <span>{t(lang, `≥ +${revGrowthThresholdPct}% مستهدف`, `≥ +${revGrowthThresholdPct}% OK`)}</span>
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       </section>
 
       {/* Proactive Operating Expense Budget Alert System by Cost Center */}
@@ -3955,9 +5006,65 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
         </div>
       </section>
 
-      {/* Non-Blocking Instant Notification Stack (Stocktake > 2% + Food Cost > 5%) */}
-      {(activeStocktakeToast || activeToastNotif) && (
+      {/* Non-Blocking Instant Notification Stack (Revenue Growth + Stocktake > 2% + Food Cost > 5%) */}
+      {(activeRevGrowthToast || activeStocktakeToast || activeToastNotif) && (
         <div className="fixed bottom-5 end-5 z-40 max-w-sm w-full flex flex-col gap-3 pointer-events-none">
+          {activeRevGrowthToast && (
+            <div
+              role="status"
+              aria-live="polite"
+              className="pointer-events-auto bg-white dark:bg-slate-900 border border-red-400 dark:border-red-600 rounded-xl p-4 shadow-md"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-2.5">
+                  <div className="p-1.5 rounded-lg bg-red-100 dark:bg-red-900/60 text-red-700 dark:text-red-300 shrink-0">
+                    <TrendingDown className="w-4 h-4" />
+                  </div>
+                  <div className="space-y-1">
+                    <div className="text-xs font-bold text-slate-900 dark:text-slate-100">
+                      {lang === 'ar' ? activeRevGrowthToast.titleAr : activeRevGrowthToast.titleEn}
+                    </div>
+                    <p className="text-[11px] text-slate-600 dark:text-slate-300 leading-relaxed">
+                      {lang === 'ar' ? activeRevGrowthToast.messageAr : activeRevGrowthToast.messageEn}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setActiveRevGrowthToast(null)}
+                  aria-label={t(lang, 'إغلاق تنبيه نمو الإيرادات', 'Close revenue growth alert')}
+                  className="p-1 rounded-md text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 cursor-pointer"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+              <div className="mt-3 pt-2.5 border-t border-slate-100 dark:border-slate-800 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={openPerformanceReviewDrilldown}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-red-700 hover:bg-red-800 text-white text-[11px] font-semibold cursor-pointer"
+                >
+                  <span>{t(lang, 'وحدة مراجعة الأداء', 'Performance Review')}</span>
+                  <ArrowUpRight className="w-3 h-3" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const updated = revGrowthNotifications.map((n) =>
+                      n.id === activeRevGrowthToast.id ? { ...n, acknowledged: true } : n
+                    );
+                    setRevGrowthNotifications(updated);
+                    saveRevGrowthNotificationsToStorage(updated);
+                    setActiveRevGrowthToast(null);
+                  }}
+                  className="px-2.5 py-1 rounded-md bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-[11px] font-semibold cursor-pointer"
+                >
+                  {t(lang, 'إقرار', 'Acknowledge')}
+                </button>
+              </div>
+            </div>
+          )}
+
           {activeStocktakeToast && (
             <div
               role="status"
@@ -4341,6 +5448,7 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
         costCenterBudgets={costCenterBudgets}
         warningThresholdPct={warningThresholdPct}
         sections={cfoPrintSections}
+        currentViewMode={cfoPrintCurrentViewMode}
       />
     </div>
 
@@ -4356,6 +5464,7 @@ export const CfoDashboard: React.FC<CfoDashboardProps> = ({
       warningThresholdPct={warningThresholdPct}
       selectedSections={cfoPrintSections}
       onChangeSections={setCfoPrintSections}
+      currentViewMode={cfoPrintCurrentViewMode}
       onExecutePrint={() => {
         setCfoPrintPreviewOpen(false);
         requestAnimationFrame(() => window.print());

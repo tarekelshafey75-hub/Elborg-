@@ -2050,3 +2050,851 @@ export function computeVatReportSummary(
   };
 }
 
+export interface BankAutoMatchOptions {
+  maxDateDiffDays?: number;
+  maxAmountTolerancePct?: number;
+  dismissedBankIds?: string[];
+}
+
+export interface BankPurchaseMatchCandidate {
+  id: string;
+  bankTxn: BankTransaction;
+  purchaseInvoice: PurchaseInvoice;
+  supplierNameEn: string;
+  bankAmount: number;
+  invoiceAmount: number;
+  amountDiff: number;
+  absAmountDiff: number;
+  amountDiffPct: number;
+  dateDiffDays: number;
+  absDateDiffDays: number;
+  confidenceScore: number;
+  matchTier: 'exact' | 'high' | 'medium';
+  reasonsAr: string[];
+  reasonsEn: string[];
+}
+
+export interface BankAutoMatchSummary {
+  unmatchedOutflowCount: number;
+  openPurchaseCount: number;
+  suggestedMatches: BankPurchaseMatchCandidate[];
+  alternativesByBankTxnId: Record<string, BankPurchaseMatchCandidate[]>;
+  totalMatchedValue: number;
+  exactOrHighCount: number;
+}
+
+function parseIsoDateMs(dateStr: string): number {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(dateStr || '').trim());
+  if (!m) return NaN;
+  return Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+}
+
+export function computeBankPurchaseAutoMatches(
+  state: ErpState,
+  options?: BankAutoMatchOptions
+): BankAutoMatchSummary {
+  const maxDateDiffDays = Math.max(0, options?.maxDateDiffDays ?? 7);
+  const maxAmountTolerancePct = Math.max(0, options?.maxAmountTolerancePct ?? 2);
+  const dismissedSet = new Set(options?.dismissedBankIds ?? []);
+
+  const unmatchedOutflows = state.bankTransactions.filter(
+    (bt) => bt.matchStatus === 'unmatched' && bt.debit > 0 && !dismissedSet.has(bt.id)
+  );
+  const openPurchases = state.purchaseInvoices.filter((po) => po.paymentStatus === 'credit');
+  const supplierById = new Map(state.suppliers.map((s) => [s.id, s]));
+
+  const allCandidates: BankPurchaseMatchCandidate[] = [];
+  const alternativesByBankTxnId: Record<string, BankPurchaseMatchCandidate[]> = {};
+
+  for (const bt of unmatchedOutflows) {
+    const btMs = parseIsoDateMs(bt.date);
+    const bankAmount = round2(bt.debit);
+    const descLower = `${bt.bankRef} ${bt.description}`.toLowerCase();
+    const rowCandidates: BankPurchaseMatchCandidate[] = [];
+
+    for (const po of openPurchases) {
+      const poMs = parseIsoDateMs(po.date);
+      if (!Number.isFinite(btMs) || !Number.isFinite(poMs)) continue;
+
+      const dateDiffDays = Math.round((btMs - poMs) / 86400000);
+      const absDateDiffDays = Math.abs(dateDiffDays);
+      if (absDateDiffDays > maxDateDiffDays) continue;
+
+      const invoiceAmount = round2(po.grandTotal);
+      if (invoiceAmount <= 0) continue;
+
+      const amountDiff = round2(bankAmount - invoiceAmount);
+      const absAmountDiff = round2(Math.abs(amountDiff));
+      const amountDiffPct = round2((absAmountDiff / invoiceAmount) * 100);
+
+      // Allow <= 1 EGP rounding even when Exact (0%) is selected
+      if (absAmountDiff > 1 && amountDiffPct > maxAmountTolerancePct) continue;
+
+      const sup = supplierById.get(po.supplierId);
+      const poTokens = [
+        po.purchaseNo.toLowerCase(),
+        po.purchaseNo.replace(/[^0-9]/g, '').slice(-4),
+        po.supplierNameAr.toLowerCase(),
+        (sup?.nameEn ?? '').toLowerCase(),
+      ].filter((tok) => tok.length >= 3);
+
+      const hasTextRefMatch = poTokens.some((tok) => {
+        if (tok.includes(' ')) {
+          return tok
+            .split(/\s+/)
+            .filter((w) => w.length >= 3 && w !== 'مزارع' && w !== 'شركة')
+            .some((w) => descLower.includes(w));
+        }
+        return descLower.includes(tok);
+      });
+
+      const tolDenom = Math.max(0.5, maxAmountTolerancePct);
+      const amountScore =
+        absAmountDiff <= 0.05 ? 65 : 65 * Math.max(0, 1 - amountDiffPct / tolDenom);
+      const dateScore =
+        maxDateDiffDays === 0
+          ? absDateDiffDays === 0
+            ? 25
+            : 0
+          : 25 * Math.max(0, 1 - absDateDiffDays / maxDateDiffDays);
+      const contextBonus = (hasTextRefMatch ? 7 : 0) + (dateDiffDays >= 0 ? 3 : 0);
+      const confidenceScore = Math.min(100, Math.max(1, Math.round(amountScore + dateScore + contextBonus)));
+
+      const matchTier: 'exact' | 'high' | 'medium' =
+        absAmountDiff <= 1 && absDateDiffDays <= 2 && confidenceScore >= 85
+          ? 'exact'
+          : confidenceScore >= 70
+          ? 'high'
+          : 'medium';
+
+      const reasonsAr: string[] = [];
+      const reasonsEn: string[] = [];
+      if (absAmountDiff <= 1) {
+        reasonsAr.push('تطابق تام للمبلغ');
+        reasonsEn.push('Exact Amount');
+      } else {
+        reasonsAr.push(`قرب المبلغ (${amountDiff >= 0 ? '+' : ''}${amountDiff.toFixed(0)} ج)`);
+        reasonsEn.push(`Amount Δ ${amountDiff >= 0 ? '+' : ''}${amountDiff.toFixed(0)} EGP`);
+      }
+
+      if (absDateDiffDays === 0) {
+        reasonsAr.push('نفس تاريخ الفاتورة');
+        reasonsEn.push('Same Date');
+      } else {
+        reasonsAr.push(`فارق ${dateDiffDays >= 0 ? '+' : ''}${dateDiffDays} يوم`);
+        reasonsEn.push(`Date ${dateDiffDays >= 0 ? '+' : ''}${dateDiffDays}d`);
+      }
+
+      if (hasTextRefMatch) {
+        reasonsAr.push('تطابق وصف المورد/المرجع');
+        reasonsEn.push('Ref/Supplier Match');
+      }
+
+      rowCandidates.push({
+        id: `${bt.id}__${po.id}`,
+        bankTxn: bt,
+        purchaseInvoice: po,
+        supplierNameEn: sup?.nameEn || po.supplierNameAr,
+        bankAmount,
+        invoiceAmount,
+        amountDiff,
+        absAmountDiff,
+        amountDiffPct,
+        dateDiffDays,
+        absDateDiffDays,
+        confidenceScore,
+        matchTier,
+        reasonsAr,
+        reasonsEn,
+      });
+    }
+
+    rowCandidates.sort(
+      (a, b) =>
+        b.confidenceScore - a.confidenceScore ||
+        a.absAmountDiff - b.absAmountDiff ||
+        a.absDateDiffDays - b.absDateDiffDays
+    );
+
+    if (rowCandidates.length > 0) {
+      alternativesByBankTxnId[bt.id] = rowCandidates;
+      allCandidates.push(...rowCandidates);
+    }
+  }
+
+  // Optimal 1-to-1 greedy pairing across all qualifying pairs
+  const sortedGlobal = [...allCandidates].sort(
+    (a, b) =>
+      b.confidenceScore - a.confidenceScore ||
+      a.absAmountDiff - b.absAmountDiff ||
+      a.absDateDiffDays - b.absDateDiffDays
+  );
+  const usedBankIds = new Set<string>();
+  const usedPoIds = new Set<string>();
+  const suggestedMatches: BankPurchaseMatchCandidate[] = [];
+
+  for (const cand of sortedGlobal) {
+    if (usedBankIds.has(cand.bankTxn.id) || usedPoIds.has(cand.purchaseInvoice.id)) continue;
+    usedBankIds.add(cand.bankTxn.id);
+    usedPoIds.add(cand.purchaseInvoice.id);
+    suggestedMatches.push(cand);
+  }
+
+  const totalMatchedValue = round2(
+    suggestedMatches.reduce((sum, m) => sum + m.bankAmount, 0)
+  );
+  const exactOrHighCount = suggestedMatches.filter(
+    (m) => m.matchTier === 'exact' || m.matchTier === 'high'
+  ).length;
+
+  return {
+    unmatchedOutflowCount: unmatchedOutflows.length,
+    openPurchaseCount: openPurchases.length,
+    suggestedMatches,
+    alternativesByBankTxnId,
+    totalMatchedValue,
+    exactOrHighCount,
+  };
+}
+
+export function applyBankPurchaseAutoMatchApproval(
+  state: ErpState,
+  links: Array<{ bankTxnId: string; purchaseInvoiceId: string }>,
+  approvedBy = 'المدير المالي (CFO)'
+): {
+  nextState: ErpState;
+  journals: JournalEntry[];
+  approvedPairs: Array<{
+    bankTxnId: string;
+    purchaseInvoiceId: string;
+    journalId: string;
+    settledApAmount: number;
+    bankDebitAmount: number;
+  }>;
+} {
+  let workingState: ErpState = {
+    ...state,
+    suppliers: state.suppliers.map((s) => ({ ...s })),
+    purchaseInvoices: state.purchaseInvoices.map((p) => ({ ...p })),
+    bankTransactions: state.bankTransactions.map((b) => ({ ...b })),
+    journalEntries: [...state.journalEntries],
+    auditLogs: [...state.auditLogs],
+  };
+
+  const now = new Date();
+  const timeStr = now.toTimeString().slice(0, 5);
+  const journals: JournalEntry[] = [];
+  const approvedPairs: Array<{
+    bankTxnId: string;
+    purchaseInvoiceId: string;
+    journalId: string;
+    settledApAmount: number;
+    bankDebitAmount: number;
+  }> = [];
+
+  const seenBankIds = new Set<string>();
+  const seenPoIds = new Set<string>();
+
+  for (let i = 0; i < links.length; i++) {
+    const { bankTxnId, purchaseInvoiceId } = links[i];
+    if (seenBankIds.has(bankTxnId) || seenPoIds.has(purchaseInvoiceId)) continue;
+
+    const txn = workingState.bankTransactions.find((b) => b.id === bankTxnId);
+    const po = workingState.purchaseInvoices.find((p) => p.id === purchaseInvoiceId);
+    if (!txn || !po || txn.matchStatus === 'matched' || txn.debit <= 0 || po.paymentStatus !== 'credit') {
+      continue;
+    }
+
+    seenBankIds.add(bankTxnId);
+    seenPoIds.add(purchaseInvoiceId);
+
+    const bankDebitAmount = round2(txn.debit);
+    const supplier = workingState.suppliers.find((s) => s.id === po.supplierId);
+    const supplierTotalAp = supplier
+      ? round2(supplier.aging0_30 + supplier.aging31_60 + supplier.aging61_90Plus)
+      : 0;
+
+    // Settle AP up to invoice grand total (or remaining supplier balance so subledger ties 100% with 2101)
+    const settledApAmount =
+      supplier && supplierTotalAp > 0
+        ? round2(Math.min(supplierTotalAp, po.grandTotal))
+        : round2(po.grandTotal);
+
+    if (supplier && supplierTotalAp > 0) {
+      let rem = settledApAmount;
+      const deduct90 = Math.min(supplier.aging61_90Plus, rem);
+      rem = round2(rem - deduct90);
+      const deduct60 = Math.min(supplier.aging31_60, rem);
+      rem = round2(rem - deduct60);
+      const deduct30 = Math.min(supplier.aging0_30, rem);
+      supplier.aging61_90Plus = round2(supplier.aging61_90Plus - deduct90);
+      supplier.aging31_60 = round2(supplier.aging31_60 - deduct60);
+      supplier.aging0_30 = round2(supplier.aging0_30 - deduct30);
+    }
+
+    const seq = workingState.journalEntries.length + 1;
+    const journalId = `JE-MATCH-${Date.now()}-${i + 1}`;
+    const journalNo = `JV-2026-${String(seq).padStart(4, '0')}`;
+    const diff = round2(bankDebitAmount - settledApAmount);
+
+    const lines: JournalEntry['lines'] = [
+      {
+        lineNo: 1,
+        accountCode: '2101',
+        accountNameAr: 'الموردون (حسابات دائنة)',
+        description: `سداد ومطابقة فاتورة ${po.purchaseNo} — ${po.supplierNameAr}`,
+        debit: settledApAmount,
+        credit: 0,
+        branchId: workingState.activeBranchId,
+        costCenter: 'CC-PROC',
+      },
+    ];
+
+    if (Math.abs(diff) > 0.005) {
+      lines.push({
+        lineNo: 2,
+        accountCode: '5308',
+        accountNameAr: 'عمولات ومصاريف بنكية',
+        description:
+          diff > 0
+            ? `فرق عمولة تحويل بنكي لمطابقة ${po.purchaseNo}`
+            : `فرق تسوية/خصم سداد بنكي ${po.purchaseNo}`,
+        debit: diff > 0 ? diff : 0,
+        credit: diff < 0 ? Math.abs(diff) : 0,
+        branchId: workingState.activeBranchId,
+        costCenter: 'CC-TREASURY',
+      });
+    }
+
+    lines.push({
+      lineNo: lines.length + 1,
+      accountCode: '1102',
+      accountNameAr: 'بنك CIB — حساب استادات',
+      description: `تسوية كشف CIB ${txn.bankRef} مقابل ${po.purchaseNo}`,
+      debit: 0,
+      credit: bankDebitAmount,
+      branchId: workingState.activeBranchId,
+      costCenter: 'CC-TREASURY',
+    });
+
+    const journal: JournalEntry = {
+      id: journalId,
+      journalNo,
+      date: txn.date,
+      period: txn.date.slice(0, 7),
+      source: 'supplier_payment',
+      referenceNo: `${po.purchaseNo} / ${txn.bankRef}`,
+      description: `اعتماد مطابقة CIB (${txn.bankRef}) مع فاتورة مشتريات ${po.purchaseNo} (${po.supplierNameAr})`,
+      createdBy: approvedBy,
+      lines,
+    };
+
+    journals.push(journal);
+    workingState.journalEntries = [journal, ...workingState.journalEntries];
+
+    workingState.purchaseInvoices = workingState.purchaseInvoices.map((item) =>
+      item.id === po.id ? { ...item, paymentStatus: 'paid_cib' as const } : item
+    );
+
+    workingState.bankTransactions = workingState.bankTransactions.map((item) =>
+      item.id === txn.id
+        ? { ...item, matchStatus: 'matched' as const, matchedJournalId: journalId }
+        : item
+    );
+
+    workingState.auditLogs = [
+      {
+        id: `AUD-MATCH-${Date.now()}-${i + 1}`,
+        timestamp: `${txn.date} ${timeStr}`,
+        user: approvedBy,
+        role: 'cfo',
+        action: 'اعتماد مطابقة كشف CIB مع فاتورة مشتريات (Auto-Match)',
+        entityType: 'BankAutoMatch',
+        entityId: `${txn.bankRef} ↔ ${po.purchaseNo}`,
+        details: `ربط حركة ${txn.bankRef} (${bankDebitAmount.toFixed(2)} ج.م) بفاتورة ${po.purchaseNo} (${po.grandTotal.toFixed(2)} ج.م) وترحيل القيد ${journalNo}`,
+      },
+      ...workingState.auditLogs,
+    ];
+
+    approvedPairs.push({
+      bankTxnId: txn.id,
+      purchaseInvoiceId: po.id,
+      journalId,
+      settledApAmount,
+      bankDebitAmount,
+    });
+  }
+
+  workingState.bankTransactions = computeBankRunningBalances(workingState.bankTransactions);
+
+  return {
+    nextState: workingState,
+    journals,
+    approvedPairs,
+  };
+}
+
+export type CfoVatPeriod = '9m_ytd' | 'Q1' | 'Q2' | 'Q3' | '9m_plus_live';
+
+export interface CfoVatMonthlyRow {
+  key: string;
+  labelAr: string;
+  labelEn: string;
+  netSales: number;
+  purchasesNet: number;
+  outputVat: number;
+  inputVat: number;
+  deductibleInputVat: number;
+  nonDeductibleCogsVat: number;
+  nonDeductibleOpexVat: number;
+  nonDeductibleInputVat: number;
+  totalInputVatIncurred: number;
+  deductibilityPct: number;
+  netPayable: number;
+  offsetPct: number;
+  momDeltaPct: number | null;
+}
+
+export interface CfoVatAuditBucket {
+  id: string;
+  treatment: 'deductible' | 'non_deductible' | 'exempt_out_of_scope';
+  titleAr: string;
+  titleEn: string;
+  glAccount: string;
+  etaRefAr: string;
+  etaRefEn: string;
+  baseAmount: number;
+  deductibleVat: number;
+  nonDeductibleVat: number;
+  auditNoteAr: string;
+  auditNoteEn: string;
+}
+
+export interface CfoVatSummary {
+  vatRate: number;
+  outputVat: number;
+  inputVat: number;
+  deductibleInputVat: number;
+  deductiblePurchaseVat: number;
+  deductibleExpenseVat: number;
+  nonDeductibleInputVat: number;
+  nonDeductibleCogsVat: number;
+  nonDeductibleOpexVat: number;
+  totalInputVatIncurred: number;
+  deductibilityRatioPct: number;
+  nonDeductibleSharePct: number;
+  taxablePurchasesBase: number;
+  nonDeductiblePurchasesBase: number;
+  exemptOutOfScopeBase: number;
+  exemptUtilitiesBase: number;
+  exemptUsufructBase: number;
+  exemptPayrollBase: number;
+  exemptBankFeesBase: number;
+  netVatPayable: number;
+  hypotheticalNetPayableIfAllDeductible: number;
+  potentialTaxShieldSavings: number;
+  recoveryRatioPct: number;
+  effectiveOutputRatePct: number;
+  outputToInputRatio: number;
+  netVatBurdenPct: number;
+  monthlyBreakdown: CfoVatMonthlyRow[];
+  maxMonthlyVatBar: number;
+  etaAuditBuckets: CfoVatAuditBucket[];
+  etaSubmittedCount: number;
+  etaQueuedCount: number;
+  ledgerOutput2201: number;
+  ledgerInput1105: number;
+  ledgerNetPayable: number;
+  livePurchaseVat: number;
+  liveExpenseVat: number;
+  liveNonDeductibleOpexVat: number;
+  livePurchasesNet: number;
+  liveTaxableExpNet: number;
+  liveNonDeductibleExpGross: number;
+  seededPurchaseVat: number;
+  salesPosVat: number;
+  salesFoodicsVat: number;
+  salesPosCount: number;
+  salesFoodicsCount: number;
+  livePurchasesCount: number;
+  liveTaxableExpensesCount: number;
+  liveNonDeductibleExpensesCount: number;
+  periodLabelAr: string;
+  periodLabelEn: string;
+}
+
+export function computeCfoVatSummary(
+  state: ErpState,
+  period: CfoVatPeriod,
+  netSalesTotal: number,
+  balancesOverride?: Record<string, number>
+): CfoVatSummary {
+  const balances = balancesOverride ?? computeAccountBalances(state);
+  const vatRate = state.vatRate || 0.14;
+  const rows =
+    period === 'Q1' || period === 'Q2' || period === 'Q3'
+      ? state.monthlyActuals2026.filter((m) => m.quarter === period)
+      : state.monthlyActuals2026;
+
+  const audited9MInputVat = 585000;
+  const audited9MCogs = state.monthlyActuals2026.reduce((a, m) => a + m.cogs, 0);
+
+  const liveSales = state.salesInvoices.filter((s) => !s.id.startsWith('INV-SEED-'));
+  const liveSalesNet = round2(liveSales.reduce((a, s) => a + s.netSales, 0));
+  const liveSalesVat = round2(liveSales.reduce((a, s) => a + s.vatAmount, 0));
+
+  const livePurchases = state.purchaseInvoices.filter((p) => !p.id.startsWith('PO-SEED-'));
+  const livePurchaseVat = round2(livePurchases.reduce((a, p) => a + p.vatAmount, 0));
+  const livePurchasesNet = round2(livePurchases.reduce((a, p) => a + p.totalBeforeTax, 0));
+
+  const liveTaxableExpenses = state.expenses.filter(
+    (e) => !e.id.startsWith('EXP-SEED-') && e.vatAmount > 0
+  );
+  const liveExpenseVat = round2(liveTaxableExpenses.reduce((a, e) => a + e.vatAmount, 0));
+  const liveTaxableExpNet = round2(liveTaxableExpenses.reduce((a, e) => a + e.amountNet, 0));
+
+  // Live non-deductible operating expenses (gross 5301 receipts posted without Acc 1105 tax credit)
+  const liveNonDeductibleExpenses = state.expenses.filter(
+    (e) => !e.id.startsWith('EXP-SEED-') && e.vatAmount <= 0 && e.categoryAccountCode === '5301'
+  );
+  const liveNonDeductibleExpGross = round2(
+    liveNonDeductibleExpenses.reduce((a, e) => a + e.amountNet, 0)
+  );
+  const embeddedVatFactor = vatRate / (1 + vatRate);
+  const liveNonDeductibleOpexVat = round2(liveNonDeductibleExpGross * embeddedVatFactor);
+
+  // Live VAT-exempt / out-of-scope expenses (Payroll 5201, Usufruct 5202, Bank 5308)
+  const liveExemptExpensesGross = round2(
+    state.expenses
+      .filter(
+        (e) => !e.id.startsWith('EXP-SEED-') && e.vatAmount <= 0 && e.categoryAccountCode !== '5301'
+      )
+      .reduce((a, e) => a + e.amountNet, 0)
+  );
+
+  const liveInputVat = round2(livePurchaseVat + liveExpenseVat);
+  const includeLive = period === '9m_plus_live';
+
+  const baseOutputVat = round2(rows.reduce((a, m) => a + m.vatOutput, 0));
+
+  const rawMonthlyBase = rows.map((m) => {
+    const deductibleInputVat = round2(
+      audited9MCogs > 0 ? (m.cogs / audited9MCogs) * audited9MInputVat : 0
+    );
+    const theoreticalCogsVat = round2(m.cogs * vatRate);
+    const nonDeductibleCogsVat = round2(Math.max(0, theoreticalCogsVat - deductibleInputVat));
+    const nonDeductibleOpexVat = round2(m.otherOpex * embeddedVatFactor);
+    const nonDeductibleInputVat = round2(nonDeductibleCogsVat + nonDeductibleOpexVat);
+    const totalInputVatIncurred = round2(deductibleInputVat + nonDeductibleInputVat);
+    const deductibilityPct =
+      totalInputVatIncurred > 0
+        ? round2((deductibleInputVat / totalInputVatIncurred) * 100)
+        : 0;
+    const netPayable = round2(m.vatOutput - deductibleInputVat);
+    const offsetPct = m.vatOutput > 0 ? round2((deductibleInputVat / m.vatOutput) * 100) : 0;
+
+    return {
+      key: m.monthKey,
+      labelAr: m.labelAr,
+      labelEn: m.labelEn,
+      netSales: m.netRevenue,
+      purchasesNet: round2(vatRate > 0 ? deductibleInputVat / vatRate : 0),
+      outputVat: m.vatOutput,
+      inputVat: deductibleInputVat,
+      deductibleInputVat,
+      nonDeductibleCogsVat,
+      nonDeductibleOpexVat,
+      nonDeductibleInputVat,
+      totalInputVatIncurred,
+      deductibilityPct,
+      netPayable,
+      offsetPct,
+    };
+  });
+
+  if (
+    includeLive &&
+    (liveSales.length > 0 || liveInputVat > 0 || liveNonDeductibleOpexVat > 0)
+  ) {
+    const liveTotalIncurred = round2(liveInputVat + liveNonDeductibleOpexVat);
+    const liveNetPayable = round2(liveSalesVat - liveInputVat);
+    rawMonthlyBase.push({
+      key: 'live-oct',
+      labelAr: 'أكتوبر (مباشر)',
+      labelEn: 'Oct (Live)',
+      netSales: liveSalesNet,
+      purchasesNet: round2(livePurchasesNet + liveTaxableExpNet),
+      outputVat: liveSalesVat,
+      inputVat: liveInputVat,
+      deductibleInputVat: liveInputVat,
+      nonDeductibleCogsVat: 0,
+      nonDeductibleOpexVat: liveNonDeductibleOpexVat,
+      nonDeductibleInputVat: liveNonDeductibleOpexVat,
+      totalInputVatIncurred: liveTotalIncurred,
+      deductibilityPct:
+        liveTotalIncurred > 0 ? round2((liveInputVat / liveTotalIncurred) * 100) : 0,
+      netPayable: liveNetPayable,
+      offsetPct: liveSalesVat > 0 ? round2((liveInputVat / liveSalesVat) * 100) : 0,
+    });
+  }
+
+  const monthlyBreakdown: CfoVatMonthlyRow[] = rawMonthlyBase.map((item, idx) => {
+    const prev = idx > 0 ? rawMonthlyBase[idx - 1] : null;
+    const momDeltaPct =
+      prev && Math.abs(prev.netPayable) > 0
+        ? round2(((item.netPayable - prev.netPayable) / Math.abs(prev.netPayable)) * 100)
+        : null;
+    return { ...item, momDeltaPct };
+  });
+
+  const baseDeductibleInputVat = round2(
+    rows.reduce(
+      (a, m) => a + (audited9MCogs > 0 ? (m.cogs / audited9MCogs) * audited9MInputVat : 0),
+      0
+    )
+  );
+  const basePurchasesNet = round2(vatRate > 0 ? baseDeductibleInputVat / vatRate : 0);
+
+  const baseNonDeductibleCogsVat = round2(
+    rows.reduce((a, m) => {
+      const mDed = audited9MCogs > 0 ? (m.cogs / audited9MCogs) * audited9MInputVat : 0;
+      return a + Math.max(0, round2(m.cogs * vatRate) - round2(mDed));
+    }, 0)
+  );
+  const baseNonDeductibleOpexGross = round2(rows.reduce((a, m) => a + m.otherOpex, 0));
+  const baseNonDeductibleOpexVat = round2(
+    rows.reduce((a, m) => a + round2(m.otherOpex * embeddedVatFactor), 0)
+  );
+
+  const outputVat = round2(baseOutputVat + (includeLive ? liveSalesVat : 0));
+  const deductiblePurchaseVat = round2(
+    baseDeductibleInputVat + (includeLive ? livePurchaseVat : 0)
+  );
+  const deductibleExpenseVat = round2(includeLive ? liveExpenseVat : 0);
+  const deductibleInputVat = round2(deductiblePurchaseVat + deductibleExpenseVat);
+
+  const nonDeductibleCogsVat = baseNonDeductibleCogsVat;
+  const nonDeductibleOpexVat = round2(
+    baseNonDeductibleOpexVat + (includeLive ? liveNonDeductibleOpexVat : 0)
+  );
+  const nonDeductibleInputVat = round2(nonDeductibleCogsVat + nonDeductibleOpexVat);
+  const totalInputVatIncurred = round2(deductibleInputVat + nonDeductibleInputVat);
+
+  const deductibilityRatioPct =
+    totalInputVatIncurred > 0
+      ? round2((deductibleInputVat / totalInputVatIncurred) * 100)
+      : 0;
+  const nonDeductibleSharePct =
+    totalInputVatIncurred > 0
+      ? round2((nonDeductibleInputVat / totalInputVatIncurred) * 100)
+      : 0;
+
+  const taxablePurchasesBase = round2(
+    basePurchasesNet + (includeLive ? livePurchasesNet + liveTaxableExpNet : 0)
+  );
+  const nonDeductibleCogsBase = round2(vatRate > 0 ? nonDeductibleCogsVat / vatRate : 0);
+  const nonDeductibleOpexNetBase = round2(
+    baseNonDeductibleOpexGross +
+      (includeLive ? liveNonDeductibleExpGross : 0) -
+      nonDeductibleOpexVat
+  );
+  const nonDeductiblePurchasesBase = round2(nonDeductibleCogsBase + nonDeductibleOpexNetBase);
+
+  const exemptUtilitiesBase = round2(rows.reduce((a, m) => a + m.electricity, 0));
+  const exemptUsufructBase = round2(
+    rows.reduce((a, m) => a + m.usufructRent, 0) + (includeLive ? liveExemptExpensesGross : 0)
+  );
+  const exemptPayrollBase = round2(rows.reduce((a, m) => a + m.payroll, 0));
+  const exemptBankFeesBase = round2(rows.reduce((a, m) => a + m.bankFeesNet, 0));
+  const exemptOutOfScopeBase = round2(
+    exemptUtilitiesBase + exemptUsufructBase + exemptPayrollBase + exemptBankFeesBase
+  );
+
+  const netVatPayable = round2(outputVat - deductibleInputVat);
+  const hypotheticalNetPayableIfAllDeductible = round2(outputVat - totalInputVatIncurred);
+  const potentialTaxShieldSavings = nonDeductibleInputVat;
+
+  const recoveryRatioPct = outputVat > 0 ? round2((deductibleInputVat / outputVat) * 100) : 0;
+  const effectiveOutputRatePct =
+    netSalesTotal > 0 ? round2((outputVat / netSalesTotal) * 100) : 0;
+  const outputToInputRatio =
+    deductibleInputVat > 0 ? round2(outputVat / deductibleInputVat) : 0;
+  const netVatBurdenPct =
+    netSalesTotal > 0 ? round2((netVatPayable / netSalesTotal) * 100) : 0;
+
+  const maxMonthlyVatBar = Math.max(
+    1,
+    ...monthlyBreakdown.map((r) =>
+      Math.max(r.outputVat, r.deductibleInputVat, r.nonDeductibleInputVat)
+    )
+  );
+
+  const etaAuditBuckets: CfoVatAuditBucket[] = [
+    {
+      id: 'BUCKET-DED-PO',
+      treatment: 'deductible',
+      titleAr: 'مشتريات خامات المطبخ بفواتير إلكترونية معتمدة (ETA e-Invoice)',
+      titleEn: 'E-Invoiced Kitchen Raw Material Purchases',
+      glAccount: '1105',
+      etaRefAr: 'مادة 22 ق 67/2016 · بند 11 إقرار نموذج 10',
+      etaRefEn: 'Art. 22 Law 67/2016 · Form 10 Line 11',
+      baseAmount: round2(basePurchasesNet + (includeLive ? livePurchasesNet : 0)),
+      deductibleVat: deductiblePurchaseVat,
+      nonDeductibleVat: 0,
+      auditNoteAr: 'مستندات ضريبية مستوفاة الشروط ومخصومة بالكامل من ضريبة المخرجات 2201.',
+      auditNoteEn: 'Full ETA e-invoice compliance; 100% creditable against Output VAT 2201.',
+    },
+    {
+      id: 'BUCKET-DED-EXP',
+      treatment: 'deductible',
+      titleAr: 'مصروفات تشغيلية خاضعة لضريبة المدخلات (بفواتير ضريبية)',
+      titleEn: 'Tax-Verified Operating Expenses (Direct Voucher VAT)',
+      glAccount: '1105',
+      etaRefAr: 'مادة 22 ق 67/2016 · بند 12 خدمات خاضعة',
+      etaRefEn: 'Art. 22 Law 67/2016 · Form 10 Line 12',
+      baseAmount: includeLive ? liveTaxableExpNet : 0,
+      deductibleVat: deductibleExpenseVat,
+      nonDeductibleVat: 0,
+      auditNoteAr:
+        deductibleExpenseVat > 0
+          ? 'فواتير مصروفات مباشرة مسجلة بحساب 1105 ضمن الفترة النشطة.'
+          : 'لا توجد مصروفات تشغيلية مباشرة مفصولة الضريبة في النطاق المختار.',
+      auditNoteEn:
+        deductibleExpenseVat > 0
+          ? 'Live operating expense vouchers credited cleanly to GL 1105.'
+          : 'No separate live deductible expense vouchers posted in selected scope.',
+    },
+    {
+      id: 'BUCKET-NONDED-COGS',
+      treatment: 'non_deductible',
+      titleAr: 'مشتريات خضروات وطازج / موردون غير مسجلين بـ ETA (محملة على COGS)',
+      titleEn: 'Uninvoiced Produce & Informal Supplier COGS (Absorbed)',
+      glAccount: '5101',
+      etaRefAr: 'مادة 22 وقرار الفاتورة الإلكترونية · غير قابل للخصم',
+      etaRefEn: 'Art. 22 & e-Invoice Mandate · Non-Creditable',
+      baseAmount: nonDeductibleCogsBase,
+      deductibleVat: 0,
+      nonDeductibleVat: nonDeductibleCogsVat,
+      auditNoteAr:
+        'فارق 14% غير المخصوم في حساب 1105 نتيجة مشتريات سوق جملة/خضار بدون فاتورة إلكترونية — يُحمّل على تكلفة المبيعات 5101.',
+      auditNoteEn:
+        'Unrecovered 14% input tax on fresh market/unregistered vendor purchases; absorbed into COGS 5101.',
+    },
+    {
+      id: 'BUCKET-NONDED-OPEX',
+      treatment: 'non_deductible',
+      titleAr: 'مصروفات تشغيلية وإدارية غير مستردة الضريبة (ضيافة / صيانة / إيصالات)',
+      titleEn: 'Indirect Admin, Hospitality & Gross Receipts (Art. 22 Disallowed)',
+      glAccount: '5301',
+      etaRefAr: 'مادة 22 و56 · ضريبة مدخلات ضمنية غير قابلة للخصم',
+      etaRefEn: 'Art. 22 & 56 · Disallowed Embedded Input VAT',
+      baseAmount: nonDeductibleOpexNetBase,
+      deductibleVat: 0,
+      nonDeductibleVat: nonDeductibleOpexVat,
+      auditNoteAr:
+        'ضريبة ضمنية 14% داخل مصروفات 5301 غير مستوفاة للإيصال الإلكتروني أو مستثناة بموجب المادة 22.',
+      auditNoteEn:
+        'Embedded 14% VAT inside gross 5301 OpEx ineligible for ETA recovery; remains P&L expense.',
+    },
+    {
+      id: 'BUCKET-EXEMPT',
+      treatment: 'exempt_out_of_scope',
+      titleAr: 'تدفقات معفاة أو خارج نطاق VAT (حق الانتفاع 5202 · رواتب 5201 · كهرباء وبنوك)',
+      titleEn: 'Exempt & Out-of-Scope Outflows (Usufruct, Payroll, Utilities & Bank)',
+      glAccount: '5201 / 5202 / 5308',
+      etaRefAr: 'جدول الإعفاءات مادة 37 (بنوك) · تعاقدات حكومية وأجور',
+      etaRefEn: 'ETA Schedule Art. 37 (Banking) · Gov. Usufruct & Payroll',
+      baseAmount: exemptOutOfScopeBase,
+      deductibleVat: 0,
+      nonDeductibleVat: 0,
+      auditNoteAr:
+        'مبالغ غير محملة بضريبة قيمة مضافة قابلة للخصم (أجور موظفين، أقساط محافظة المنوفية، عمولات CIB المعفاة).',
+      auditNoteEn:
+        'Zero-VAT / exempt outflows (staff payroll, Menoufia Governorate usufruct rent, exempt CIB banking fees).',
+    },
+  ];
+
+  const salesPosInvoices = state.salesInvoices.filter((s) => s.source === 'pos');
+  const salesFoodicsInvoices = state.salesInvoices.filter((s) => s.source !== 'pos');
+  const salesPosVat = round2(salesPosInvoices.reduce((a, s) => a + s.vatAmount, 0));
+  const salesFoodicsVat = round2(salesFoodicsInvoices.reduce((a, s) => a + s.vatAmount, 0));
+  const seededPurchaseVat = round2(
+    state.purchaseInvoices
+      .filter((p) => p.id.startsWith('PO-SEED-'))
+      .reduce((a, p) => a + p.vatAmount, 0)
+  );
+
+  const etaSubmittedCount = state.salesInvoices.filter((inv) => inv.etaStatus === 'submitted').length;
+  const etaQueuedCount = state.salesInvoices.filter((inv) => inv.etaStatus === 'queued_offline').length;
+  const ledgerOutput2201 = balances['2201'] ?? 0;
+  const ledgerInput1105 = balances['1105'] ?? 0;
+
+  const periodLabelAr =
+    period === '9m_ytd'
+      ? 'يناير – سبتمبر 2026 (9 شهور)'
+      : period === '9m_plus_live'
+      ? '9 شهور + العمليات المباشرة'
+      : `${period} 2026`;
+  const periodLabelEn =
+    period === '9m_ytd'
+      ? 'Jan – Sep 2026 (9M YTD)'
+      : period === '9m_plus_live'
+      ? '9M YTD + Live Operations'
+      : `${period} 2026`;
+
+  return {
+    vatRate,
+    outputVat,
+    inputVat: deductibleInputVat,
+    deductibleInputVat,
+    deductiblePurchaseVat,
+    deductibleExpenseVat,
+    nonDeductibleInputVat,
+    nonDeductibleCogsVat,
+    nonDeductibleOpexVat,
+    totalInputVatIncurred,
+    deductibilityRatioPct,
+    nonDeductibleSharePct,
+    taxablePurchasesBase,
+    nonDeductiblePurchasesBase,
+    exemptOutOfScopeBase,
+    exemptUtilitiesBase,
+    exemptUsufructBase,
+    exemptPayrollBase,
+    exemptBankFeesBase,
+    netVatPayable,
+    hypotheticalNetPayableIfAllDeductible,
+    potentialTaxShieldSavings,
+    recoveryRatioPct,
+    effectiveOutputRatePct,
+    outputToInputRatio,
+    netVatBurdenPct,
+    monthlyBreakdown,
+    maxMonthlyVatBar,
+    etaAuditBuckets,
+    etaSubmittedCount,
+    etaQueuedCount,
+    ledgerOutput2201,
+    ledgerInput1105,
+    ledgerNetPayable: round2(ledgerOutput2201 - ledgerInput1105),
+    livePurchaseVat,
+    liveExpenseVat,
+    liveNonDeductibleOpexVat,
+    livePurchasesNet,
+    liveTaxableExpNet,
+    liveNonDeductibleExpGross,
+    seededPurchaseVat,
+    salesPosVat,
+    salesFoodicsVat,
+    salesPosCount: salesPosInvoices.length,
+    salesFoodicsCount: salesFoodicsInvoices.length,
+    livePurchasesCount: livePurchases.length,
+    liveTaxableExpensesCount: liveTaxableExpenses.length,
+    liveNonDeductibleExpensesCount: liveNonDeductibleExpenses.length,
+    periodLabelAr,
+    periodLabelEn,
+  };
+}
+
+
+

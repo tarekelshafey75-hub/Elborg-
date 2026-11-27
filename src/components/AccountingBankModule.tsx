@@ -1,25 +1,45 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
+import * as XLSX from 'xlsx';
 import {
+  AlertCircle,
+  ArrowLeftRight,
   BookOpenCheck,
   CalendarRange,
+  CheckCheck,
   CheckCircle2,
   Download,
   FileSpreadsheet,
   Landmark,
+  Link2,
+  Loader2,
   Percent,
+  Plus,
   Printer,
   ReceiptText,
   RotateCcw,
   ShieldCheck,
+  Sparkles,
+  Upload,
+  X,
 } from 'lucide-react';
 import { ErpState, Language } from '../types/erp';
 import {
   computeAccountBalances,
+  computeBankPurchaseAutoMatches,
   computeTrialBalanceTotals,
   computeVatReportSummary,
+  round2,
   VatReportPeriod,
 } from '../utils/erpEngine';
 import { fmtMoney, fmtPct, t } from '../utils/formatters';
+
+interface ImportedBankRowDraft {
+  date: string;
+  bankRef?: string;
+  description: string;
+  debit: number;
+  credit: number;
+}
 
 interface AccountingBankModuleProps {
   state: ErpState;
@@ -33,6 +53,12 @@ interface AccountingBankModuleProps {
     applyVat: boolean;
     paymentMethod: 'cash' | 'visa_cib';
   }) => Promise<void>;
+  onImportBankStatements?: (
+    transactions: ImportedBankRowDraft[]
+  ) => Promise<{ insertedCount: number; skippedCount: number }>;
+  onApproveBankAutoMatches?: (
+    links: Array<{ bankTxnId: string; purchaseInvoiceId: string }>
+  ) => Promise<number>;
 }
 
 export const AccountingBankModule: React.FC<AccountingBankModuleProps> = ({
@@ -41,6 +67,8 @@ export const AccountingBankModule: React.FC<AccountingBankModuleProps> = ({
   onReverseJournal,
   onReconcileBank,
   onRecordExpense,
+  onImportBankStatements,
+  onApproveBankAutoMatches,
 }) => {
   const [subTab, setSubTab] = useState<'journals' | 'coa' | 'bank' | 'vat' | 'expense'>('journals');
   const [sourceFilter, setSourceFilter] = useState<string>('all');
@@ -53,9 +81,267 @@ export const AccountingBankModule: React.FC<AccountingBankModuleProps> = ({
   const [expVat, setExpVat] = useState(true);
   const [expPay, setExpPay] = useState<'cash' | 'visa_cib'>('visa_cib');
 
+  // CIB Statement Import & Auto-Match CFO Review State
+  const bankFileInputRef = useRef<HTMLInputElement | null>(null);
+  const [maxDateDiffDays, setMaxDateDiffDays] = useState<number>(7);
+  const [maxAmountTolerancePct, setMaxAmountTolerancePct] = useState<number>(2);
+  const [dismissedMatchBankIds, setDismissedMatchBankIds] = useState<string[]>([]);
+  const [selectedPoOverrides, setSelectedPoOverrides] = useState<Record<string, string>>({});
+  const [approvingMatchKey, setApprovingMatchKey] = useState<string | null>(null);
+  const [importingBankRows, setImportingBankRows] = useState(false);
+  const [showQuickBankAdd, setShowQuickBankAdd] = useState(false);
+  const [quickBankDate, setQuickBankDate] = useState('2026-10-16');
+  const [quickBankRef, setQuickBankRef] = useState('CIB-261016-DAIRY');
+  const [quickBankDesc, setQuickBankDesc] = useState('تحويل بنكي — مزارع المنوفية للألبان (سداد PO-2026-0418)');
+  const [quickBankDebit, setQuickBankDebit] = useState<number>(48222);
+  const [quickBankCredit, setQuickBankCredit] = useState<number>(0);
+  const [bankNotice, setBankNotice] = useState<{ type: 'success' | 'info' | 'error'; text: string } | null>(null);
+
   const balances = useMemo(() => computeAccountBalances(state), [state]);
   const tb = useMemo(() => computeTrialBalanceTotals(state), [state]);
   const vatReport = useMemo(() => computeVatReportSummary(state, vatPeriod), [state, vatPeriod]);
+
+  const autoMatchSummary = useMemo(
+    () =>
+      computeBankPurchaseAutoMatches(state, {
+        maxDateDiffDays,
+        maxAmountTolerancePct,
+        dismissedBankIds: dismissedMatchBankIds,
+      }),
+    [state, maxDateDiffDays, maxAmountTolerancePct, dismissedMatchBankIds]
+  );
+
+  const openPurchaseInvoices = useMemo(
+    () => state.purchaseInvoices.filter((po) => po.paymentStatus === 'credit'),
+    [state.purchaseInvoices]
+  );
+
+  const suggestedMatchByBankId = useMemo(() => {
+    const map = new Map<string, (typeof autoMatchSummary.suggestedMatches)[number]>();
+    for (const match of autoMatchSummary.suggestedMatches) {
+      const overridePoId = selectedPoOverrides[match.bankTxn.id];
+      if (overridePoId) {
+        const alt = (autoMatchSummary.alternativesByBankTxnId[match.bankTxn.id] ?? []).find(
+          (c) => c.purchaseInvoice.id === overridePoId
+        );
+        if (alt) {
+          map.set(match.bankTxn.id, alt);
+          continue;
+        }
+      }
+      map.set(match.bankTxn.id, match);
+    }
+    return map;
+  }, [autoMatchSummary, selectedPoOverrides]);
+
+  const resolvedMatches = useMemo(
+    () => Array.from(suggestedMatchByBankId.values()),
+    [suggestedMatchByBankId]
+  );
+
+  const normalizeImportDate = (raw: unknown): string => {
+    if (typeof raw === 'number' && Number.isFinite(raw) && raw > 25569) {
+      const utcMs = Math.round((raw - 25569) * 86400 * 1000);
+      return new Date(utcMs).toISOString().slice(0, 10);
+    }
+    const str = String(raw ?? '').trim();
+    if (/^\d{4}-\d{2}-\d{2}/.test(str)) return str.slice(0, 10);
+    const dmy = /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/.exec(str);
+    if (dmy) {
+      return `${dmy[3]}-${dmy[2].padStart(2, '0')}-${dmy[1].padStart(2, '0')}`;
+    }
+    return new Date().toISOString().slice(0, 10);
+  };
+
+  const parseBankNumber = (val: unknown): number => {
+    if (typeof val === 'number') return Number.isFinite(val) ? val : 0;
+    const cleaned = String(val ?? '').replace(/[^0-9.\-]/g, '');
+    const parsed = Number(cleaned);
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+
+  const handleBankFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file || !onImportBankStatements) return;
+
+    setImportingBankRows(true);
+    setBankNotice(null);
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array' });
+      const firstSheet = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(firstSheet, { defval: '' });
+
+      const mapped: ImportedBankRowDraft[] = [];
+      rows.forEach((row, idx) => {
+        const entries = Object.entries(row).map(([k, v]) => [k.trim().toLowerCase(), v] as const);
+        const pick = (patterns: string[]): unknown => {
+          const found = entries.find(([key]) => patterns.some((p) => key.includes(p)));
+          return found ? found[1] : '';
+        };
+
+        const dateVal = pick(['date', 'تاريخ', 'value date', 'posting']);
+        const refVal = pick(['ref', 'reference', 'مرجع', 'رقم']);
+        const descVal = pick(['desc', 'narration', 'details', 'particular', 'وصف', 'بيان']);
+        const debitVal = pick(['debit', 'outflow', 'withdrawal', 'dr', 'مدين', 'صادر', 'مسحوب']);
+        const creditVal = pick(['credit', 'inflow', 'deposit', 'cr', 'دائن', 'وارد', 'ايداع', 'إيداع']);
+        const amountVal = pick(['amount', 'مبلغ', 'القيمة']);
+
+        let debit = Math.max(0, round2(parseBankNumber(debitVal)));
+        let credit = Math.max(0, round2(parseBankNumber(creditVal)));
+
+        if (debit === 0 && credit === 0 && amountVal !== '') {
+          const signed = round2(parseBankNumber(amountVal));
+          if (signed < 0) debit = Math.abs(signed);
+          else if (signed > 0) credit = signed;
+        }
+
+        if (debit <= 0 && credit <= 0) return;
+
+        mapped.push({
+          date: normalizeImportDate(dateVal),
+          bankRef: String(refVal || '').trim() || `CIB-CSV-${Date.now().toString().slice(-6)}-${idx + 1}`,
+          description: String(descVal || '').trim() || 'حركة مستوردة من كشف حساب CIB',
+          debit,
+          credit,
+        });
+      });
+
+      if (mapped.length === 0) {
+        setBankNotice({
+          type: 'error',
+          text: t(
+            lang,
+            'لم يتم العثور على حركات مدين/دائن صالحة في الملف. تأكد من وجود أعمدة Date / Debit / Credit / Description.',
+            'No valid debit/credit rows found. Ensure columns include Date, Description, Debit/Outflow, Credit/Inflow.'
+          ),
+        });
+        return;
+      }
+
+      const res = await onImportBankStatements(mapped);
+      setDismissedMatchBankIds([]);
+      setBankNotice({
+        type: 'success',
+        text: t(
+          lang,
+          `تم استيراد ${res.insertedCount} حركة من كشف CIB (وتخطي ${res.skippedCount} مكررة) — يقوم المحرك الآن بفحص المطابقة التلقائية مع الفواتير المفتوحة.`,
+          `Imported ${res.insertedCount} CIB statement line(s) (${res.skippedCount} duplicate(s) skipped) — Auto-Match updated.`
+        ),
+      });
+    } catch {
+      setBankNotice({
+        type: 'error',
+        text: t(lang, 'تعذر قراءة ملف كشف الحساب. يرجى رفع ملف CSV أو Excel صالح.', 'Could not parse statement file. Please upload a valid CSV or Excel file.'),
+      });
+    } finally {
+      setImportingBankRows(false);
+    }
+  };
+
+  const handleQuickBankImportSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!onImportBankStatements) return;
+    if (quickBankDebit <= 0 && quickBankCredit <= 0) return;
+    setImportingBankRows(true);
+    setBankNotice(null);
+    try {
+      const res = await onImportBankStatements([
+        {
+          date: quickBankDate,
+          bankRef: quickBankRef.trim() || undefined,
+          description: quickBankDesc.trim() || 'حركة كشف حساب بنك CIB',
+          debit: round2(Math.max(0, quickBankDebit)),
+          credit: round2(Math.max(0, quickBankCredit)),
+        },
+      ]);
+      setDismissedMatchBankIds([]);
+      setShowQuickBankAdd(false);
+      setBankNotice({
+        type: res.insertedCount > 0 ? 'success' : 'info',
+        text:
+          res.insertedCount > 0
+            ? t(
+                lang,
+                `تم إدراج حركة كشف CIB (${quickBankRef}) وتشغيل المطابقة التلقائية مع الفواتير المفتوحة.`,
+                `Imported CIB line (${quickBankRef}) and scanned against open purchase invoices.`
+              )
+            : t(
+                lang,
+                'هذه الحركة مسجلة بالفعل في كشف بنك CIB (تم تجنب التكرار).',
+                'This CIB bank reference/row already exists in the ledger (skipped duplicate).'
+              ),
+      });
+    } finally {
+      setImportingBankRows(false);
+    }
+  };
+
+  const handleDownloadSampleCibCsv = () => {
+    const samplePo = openPurchaseInvoices[0];
+    const poDate = samplePo?.date || '2026-10-15';
+    const poAmt = samplePo ? samplePo.grandTotal.toFixed(2) : '48222.00';
+    const poDesc = samplePo
+      ? `تحويل بنكي ${samplePo.supplierNameAr} - ${samplePo.purchaseNo}`
+      : 'تحويل بنكي مورد مزارع المنوفية للألبان';
+    const lines = [
+      'Date,BankRef,Description,Debit,Credit',
+      `${poDate},CIB-STMT-${Date.now().toString().slice(-6)},"${poDesc}",${poAmt},0`,
+    ];
+    const csv = '\uFEFF' + lines.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'CIB_Statement_Template.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleRunAutoMatchScan = () => {
+    setDismissedMatchBankIds([]);
+    setSelectedPoOverrides({});
+    setBankNotice({
+      type: autoMatchSummary.suggestedMatches.length > 0 ? 'success' : 'info',
+      text:
+        autoMatchSummary.suggestedMatches.length > 0
+          ? t(
+              lang,
+              `رصد Auto-Match عدد ${autoMatchSummary.suggestedMatches.length} مطابقة محتملة بناءً على قرب التاريخ (±${maxDateDiffDays} يوم) والمبلغ (±${maxAmountTolerancePct}%) بانتظار اعتماد المدير المالي.`,
+              `Auto-Match identified ${autoMatchSummary.suggestedMatches.length} potential link(s) within ±${maxDateDiffDays}d and ±${maxAmountTolerancePct}% awaiting CFO approval.`
+            )
+          : t(
+              lang,
+              `لا توجد مطابقات ضمن النطاق الحالي (±${maxDateDiffDays} يوم / ±${maxAmountTolerancePct}%). جرّب توسيع النطاق أو استيراد كشف CIB جديد.`,
+              `No candidate pairs matched within ±${maxDateDiffDays}d and ±${maxAmountTolerancePct}%. Try widening tolerances or importing a CIB statement.`
+            ),
+    });
+  };
+
+  const handleApproveLinks = async (
+    links: Array<{ bankTxnId: string; purchaseInvoiceId: string }>,
+    keyLabel: string
+  ) => {
+    if (!onApproveBankAutoMatches || links.length === 0) return;
+    setApprovingMatchKey(keyLabel);
+    setBankNotice(null);
+    try {
+      const count = await onApproveBankAutoMatches(links);
+      if (count > 0) {
+        setBankNotice({
+          type: 'success',
+          text: t(
+            lang,
+            `اعتماد CFO مكتمل: تم ربط ${count} حركة CIB بفواتير المشتريات المفتوحة وتحديث الموردين (2101) وبنك CIB (1102).`,
+            `CFO Approval Complete: Linked ${count} CIB statement row(s) to open purchase invoices and posted AP settlement journals.`
+          ),
+        });
+      }
+    } finally {
+      setApprovingMatchKey(null);
+    }
+  };
 
   const filteredJournals = useMemo(() => {
     if (sourceFilter === 'all') return state.journalEntries;
@@ -308,26 +594,542 @@ export const AccountingBankModule: React.FC<AccountingBankModuleProps> = ({
         </div>
       )}
 
-      {/* TAB 3: BANK RECONCILIATION */}
+      {/* TAB 3: BANK RECONCILIATION & CIB AUTO-MATCH */}
       {subTab === 'bank' && (
         <div className="space-y-4">
-          <div className="bg-emerald-50/70 border border-emerald-200 rounded-xl p-4 flex items-start gap-3">
-            <Landmark className="w-5 h-5 text-emerald-700 shrink-0 mt-0.5" />
-            <div className="text-xs text-slate-800 space-y-1">
-              <div className="font-bold text-emerald-900">
-                {t(lang, 'حالة تسوية بنك CIB وحساب وسيط 1103 (VISA/POS)', 'CIB Bank & Account 1103 (VISA/POS) Clearing Status')}
+          <div className="bg-emerald-50/70 border border-emerald-200 rounded-xl p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+            <div className="flex items-start gap-3">
+              <Landmark className="w-5 h-5 text-emerald-700 shrink-0 mt-0.5" />
+              <div className="text-xs text-slate-800 space-y-1">
+                <div className="font-bold text-emerald-900">
+                  {t(lang, 'حالة تسوية بنك CIB وحساب وسيط 1103 (VISA/POS) والمطابقة الآلية للفواتير', 'CIB Bank, Account 1103 Clearing & Purchase Invoice Auto-Match')}
+                </div>
+                <div>
+                  {t(
+                    lang,
+                    `رصيد بنك CIB (1102): ${fmtMoney(balances['1102'] ?? 0, 2)} ج.م · رصيد حساب 1103: ${fmtMoney(balances['1103'] ?? 0, 2)} ج.م · فواتير شراء آجلة مفتوحة: ${openPurchaseInvoices.length}`,
+                    `CIB Balance (1102): ${fmtMoney(balances['1102'] ?? 0, 2)} EGP · Account 1103: ${fmtMoney(balances['1103'] ?? 0, 2)} EGP · Open Credit POs: ${openPurchaseInvoices.length}`
+                  )}
+                </div>
               </div>
-              <div>
-                {t(
-                  lang,
-                  `رصيد بنك CIB (1102): ${fmtMoney(balances['1102'] ?? 0, 2)} ج.م · رصيد حساب 1103: ${fmtMoney(balances['1103'] ?? 0, 2)} ج.م (تم توريد تسوية 1,276,578.62 ج.م بالكامل في 20 أبريل 2026).`,
-                  `CIB Balance (1102): ${fmtMoney(balances['1102'] ?? 0, 2)} EGP · Account 1103: ${fmtMoney(balances['1103'] ?? 0, 2)} EGP (1,276,578.62 EGP batch settled 20 Apr 2026).`
-                )}
-              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 no-print">
+              <input
+                ref={bankFileInputRef}
+                type="file"
+                accept=".csv,.xlsx,.xls"
+                onChange={handleBankFileUpload}
+                className="hidden"
+              />
+              <button
+                type="button"
+                disabled={importingBankRows}
+                onClick={() => bankFileInputRef.current?.click()}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-teal-700 hover:bg-teal-800 disabled:opacity-60 text-white text-xs font-semibold cursor-pointer transition-colors"
+              >
+                {importingBankRows ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Upload className="w-3.5 h-3.5" />}
+                <span>{t(lang, 'استيراد كشف CIB (CSV/Excel)', 'Import CIB Statement')}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowQuickBankAdd((prev) => !prev)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-800 text-xs font-semibold cursor-pointer transition-colors"
+              >
+                <Plus className="w-3.5 h-3.5 text-teal-700" />
+                <span>{t(lang, 'إدخال حركة كشف سريعة', 'Add Statement Row')}</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleDownloadSampleCibCsv}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 text-xs font-medium cursor-pointer transition-colors"
+                title={t(lang, 'تنزيل نموذج CSV متوافق مع استيراد كشف CIB', 'Download CIB CSV import template')}
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>{t(lang, 'نموذج CSV', 'CSV Template')}</span>
+              </button>
             </div>
           </div>
 
+          {bankNotice && (
+            <div
+              className={`rounded-xl border px-4 py-2.5 text-xs flex items-center justify-between gap-3 ${
+                bankNotice.type === 'success'
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                  : bankNotice.type === 'error'
+                  ? 'bg-red-50 border-red-200 text-red-900'
+                  : 'bg-slate-50 border-slate-200 text-slate-800'
+              }`}
+            >
+              <span className="flex items-center gap-2 font-medium">
+                {bankNotice.type === 'error' ? (
+                  <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+                ) : (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
+                )}
+                {bankNotice.text}
+              </span>
+              <button
+                type="button"
+                onClick={() => setBankNotice(null)}
+                className="p-1 text-slate-500 hover:text-slate-900 cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+
+          {/* Optional Quick Manual CIB Statement Row Entry */}
+          {showQuickBankAdd && (
+            <form
+              onSubmit={handleQuickBankImportSubmit}
+              className="bg-white border border-teal-200 rounded-xl p-4 space-y-3"
+            >
+              <div className="flex items-center justify-between">
+                <h3 className="text-xs font-bold text-slate-900">
+                  {t(lang, 'إدراج حركة كشف حساب بنك CIB جديدة للمطابقة الآلية', 'Insert CIB Statement Line for Auto-Match')}
+                </h3>
+                <button
+                  type="button"
+                  onClick={() => setShowQuickBankAdd(false)}
+                  className="text-xs text-slate-500 hover:text-slate-800 cursor-pointer"
+                >
+                  {t(lang, 'إغلاق', 'Close')}
+                </button>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 text-xs">
+                <div>
+                  <label className="block text-slate-600 mb-1">{t(lang, 'التاريخ', 'Date')}</label>
+                  <input
+                    type="date"
+                    value={quickBankDate}
+                    onChange={(e) => setQuickBankDate(e.target.value)}
+                    className="w-full px-2.5 py-1.5 border border-slate-200 rounded-lg font-mono-num"
+                    dir="ltr"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-600 mb-1">{t(lang, 'المرجع البنكي', 'Bank Ref')}</label>
+                  <input
+                    type="text"
+                    value={quickBankRef}
+                    onChange={(e) => setQuickBankRef(e.target.value)}
+                    className="w-full px-2.5 py-1.5 border border-slate-200 rounded-lg font-mono-num"
+                    dir="ltr"
+                  />
+                </div>
+                <div className="lg:col-span-2">
+                  <label className="block text-slate-600 mb-1">{t(lang, 'وصف الكشف البنكي', 'Statement Description')}</label>
+                  <input
+                    type="text"
+                    value={quickBankDesc}
+                    onChange={(e) => setQuickBankDesc(e.target.value)}
+                    className="w-full px-2.5 py-1.5 border border-slate-200 rounded-lg"
+                    required
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="block text-slate-600 mb-1">{t(lang, 'صادر (مدين)', 'Debit')}</label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      value={quickBankDebit}
+                      onChange={(e) => setQuickBankDebit(Number(e.target.value) || 0)}
+                      className="w-full px-2 py-1.5 border border-slate-200 rounded-lg font-mono-num"
+                      dir="ltr"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-600 mb-1">{t(lang, 'وارد (دائن)', 'Credit')}</label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      value={quickBankCredit}
+                      onChange={(e) => setQuickBankCredit(Number(e.target.value) || 0)}
+                      className="w-full px-2 py-1.5 border border-slate-200 rounded-lg font-mono-num"
+                      dir="ltr"
+                    />
+                  </div>
+                </div>
+              </div>
+              <div className="flex justify-end">
+                <button
+                  type="submit"
+                  disabled={importingBankRows}
+                  className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-xs font-semibold cursor-pointer"
+                >
+                  {importingBankRows ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+                  <span>{t(lang, 'استيراد وتشغيل Auto-Match', 'Import & Run Auto-Match')}</span>
+                </button>
+              </div>
+            </form>
+          )}
+
+          {/* Auto-Match Engine: CIB Statements <-> Open Purchase Invoices (CFO Approval Queue) */}
+          <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+            <div className="px-5 py-4 border-b border-slate-200 bg-slate-50/70 flex flex-col xl:flex-row xl:items-center justify-between gap-4">
+              <div className="flex items-start gap-3">
+                <div className="p-2 rounded-lg bg-teal-50 border border-teal-200 text-teal-700 shrink-0">
+                  <Sparkles className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="text-sm font-bold text-slate-900">
+                      {t(
+                        lang,
+                        'محرك المطابقة التلقائية (Auto-Match): كشف حساب CIB ↔ فواتير المشتريات المفتوحة',
+                        'CIB Statement ↔ Open Purchase Invoice Auto-Match (CFO Approval)'
+                      )}
+                    </h3>
+                    <span
+                      className={`px-2 py-0.5 rounded border text-[11px] font-bold font-mono-num ${
+                        resolvedMatches.length > 0
+                          ? 'bg-amber-50 border-amber-200 text-amber-800'
+                          : 'bg-slate-100 border-slate-200 text-slate-600'
+                      }`}
+                      dir="ltr"
+                    >
+                      {resolvedMatches.length} {t(lang, 'مطابقة مقترحة', 'Candidate(s)')}
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    {t(
+                      lang,
+                      'يربط تلقائياً الحركات الصادرة غير المطابقة من كشف CIB مع فواتير المشتريات الآجلة المفتوحة وفق قرب التاريخ والمبلغ، مع تمييز المرشحين لاعتماد المدير المالي (CFO).',
+                      'Automatically pairs unmatched CIB debit outflows with open credit purchase invoices using date and amount proximity, highlighting candidates for CFO sign-off.'
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 no-print">
+                <label className="flex items-center gap-1.5 text-xs bg-white border border-slate-200 rounded-lg px-2.5 py-1.5">
+                  <span className="text-slate-500">{t(lang, 'نطاق التاريخ', 'Date Window')}</span>
+                  <select
+                    value={maxDateDiffDays}
+                    onChange={(e) => setMaxDateDiffDays(Number(e.target.value))}
+                    className="font-mono-num font-bold text-slate-900 bg-transparent outline-none cursor-pointer"
+                    dir="ltr"
+                  >
+                    <option value={3}>±3d</option>
+                    <option value={7}>±7d</option>
+                    <option value={14}>±14d</option>
+                    <option value={30}>±30d</option>
+                  </select>
+                </label>
+
+                <label className="flex items-center gap-1.5 text-xs bg-white border border-slate-200 rounded-lg px-2.5 py-1.5">
+                  <span className="text-slate-500">{t(lang, 'تفاوت المبلغ', 'Amount Tol.')}</span>
+                  <select
+                    value={maxAmountTolerancePct}
+                    onChange={(e) => setMaxAmountTolerancePct(Number(e.target.value))}
+                    className="font-mono-num font-bold text-slate-900 bg-transparent outline-none cursor-pointer"
+                    dir="ltr"
+                  >
+                    <option value={0}>Exact (0%)</option>
+                    <option value={1}>±1%</option>
+                    <option value={2}>±2%</option>
+                    <option value={5}>±5%</option>
+                  </select>
+                </label>
+
+                <button
+                  type="button"
+                  onClick={handleRunAutoMatchScan}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-teal-200 bg-teal-50 hover:bg-teal-100 text-teal-800 text-xs font-semibold cursor-pointer transition-colors"
+                >
+                  <ArrowLeftRight className="w-3.5 h-3.5" />
+                  <span>{t(lang, 'فحص Auto-Match', 'Run Auto-Match')}</span>
+                </button>
+
+                {resolvedMatches.length > 0 && (
+                  <button
+                    type="button"
+                    disabled={approvingMatchKey !== null}
+                    onClick={() =>
+                      handleApproveLinks(
+                        resolvedMatches.map((m) => ({
+                          bankTxnId: m.bankTxn.id,
+                          purchaseInvoiceId: m.purchaseInvoice.id,
+                        })),
+                        'ALL'
+                      )
+                    }
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 disabled:opacity-60 text-white text-xs font-semibold cursor-pointer transition-colors"
+                  >
+                    {approvingMatchKey === 'ALL' ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <CheckCheck className="w-3.5 h-3.5" />
+                    )}
+                    <span>
+                      {t(
+                        lang,
+                        `اعتماد CFO الكلي (${resolvedMatches.length})`,
+                        `CFO Approve All (${resolvedMatches.length})`
+                      )}
+                    </span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Summary KPI Strip */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 divide-y lg:divide-y-0 lg:divide-x lg:rtl:divide-x-reverse divide-slate-200 border-b border-slate-200 text-xs">
+              <div className="px-4 py-2.5">
+                <div className="text-[11px] text-slate-500">{t(lang, 'حركات CIB صادرة معلقة', 'Unmatched CIB Outflows')}</div>
+                <div className="font-mono-num font-bold text-slate-900 text-sm mt-0.5" dir="ltr">
+                  {autoMatchSummary.unmatchedOutflowCount}
+                </div>
+              </div>
+              <div className="px-4 py-2.5">
+                <div className="text-[11px] text-slate-500">{t(lang, 'فواتير مشتريات مفتوحة (آجل)', 'Open Credit POs')}</div>
+                <div className="font-mono-num font-bold text-amber-700 text-sm mt-0.5" dir="ltr">
+                  {autoMatchSummary.openPurchaseCount} (
+                  {fmtMoney(openPurchaseInvoices.reduce((a, p) => a + p.grandTotal, 0), 0)} EGP)
+                </div>
+              </div>
+              <div className="px-4 py-2.5">
+                <div className="text-[11px] text-slate-500">{t(lang, 'مرشحو المطابقة بانتظار CFO', 'Pending CFO Approval')}</div>
+                <div className="font-mono-num font-bold text-teal-700 text-sm mt-0.5" dir="ltr">
+                  {resolvedMatches.length} ({autoMatchSummary.exactOrHighCount} High/Exact)
+                </div>
+              </div>
+              <div className="px-4 py-2.5">
+                <div className="text-[11px] text-slate-500">{t(lang, 'إجمالي قيمة المطابقات المقترحة', 'Candidate Settlement Total')}</div>
+                <div className="font-mono-num font-bold text-slate-900 text-sm mt-0.5" dir="ltr">
+                  {fmtMoney(
+                    resolvedMatches.reduce((a, m) => a + m.bankAmount, 0),
+                    2
+                  )}{' '}
+                  EGP
+                </div>
+              </div>
+            </div>
+
+            {/* Highlighted Candidates List */}
+            {resolvedMatches.length === 0 ? (
+              <div className="p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-slate-600">
+                <div className="space-y-1">
+                  <div className="font-semibold text-slate-800">
+                    {t(
+                      lang,
+                      'لا توجد مطابقات تلقائية معلقة ضمن حدود التاريخ والمبلغ الحالية.',
+                      'No pending Auto-Match candidates within current date & amount tolerances.'
+                    )}
+                  </div>
+                  <div>
+                    {openPurchaseInvoices.length > 0
+                      ? t(
+                          lang,
+                          `توجد ${openPurchaseInvoices.length} فاتورة مشتريات آجلة مفتوحة (مثل ${openPurchaseInvoices[0].purchaseNo} بمبلغ ${fmtMoney(openPurchaseInvoices[0].grandTotal, 0)} ج.م في ${openPurchaseInvoices[0].date}). استورد كشف CIB يحتوي على السداد أو اضغط "إدخال حركة كشف سريعة" لاختبار الربط.`,
+                          `${openPurchaseInvoices.length} open credit PO(s) available (e.g. ${openPurchaseInvoices[0].purchaseNo} for ${fmtMoney(openPurchaseInvoices[0].grandTotal, 0)} EGP on ${openPurchaseInvoices[0].date}). Import a CIB statement CSV/Excel or add a statement row to detect matches.`
+                        )
+                      : t(
+                          lang,
+                          'جميع فواتير المشتريات المسجلة مسددة بالكامل حالياً.',
+                          'All recorded purchase invoices are currently settled.'
+                        )}
+                  </div>
+                </div>
+                {openPurchaseInvoices.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const targetPo = openPurchaseInvoices[0];
+                      setQuickBankDate(targetPo.date);
+                      setQuickBankRef(`CIB-${targetPo.purchaseNo}`);
+                      setQuickBankDesc(`تحويل بنكي — ${targetPo.supplierNameAr} (${targetPo.purchaseNo})`);
+                      setQuickBankDebit(targetPo.grandTotal);
+                      setQuickBankCredit(0);
+                      setShowQuickBankAdd(true);
+                    }}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-teal-300 bg-teal-50 hover:bg-teal-100 text-teal-800 font-semibold whitespace-nowrap cursor-pointer shrink-0"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>{t(lang, 'تجهيز حركة CIB مطابقة للفاتورة', 'Pre-fill Matching CIB Row')}</span>
+                  </button>
+                )}
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-100">
+                {resolvedMatches.map((cand) => {
+                  const alts = autoMatchSummary.alternativesByBankTxnId[cand.bankTxn.id] ?? [cand];
+                  const tierBadge =
+                    cand.matchTier === 'exact'
+                      ? {
+                          cls: 'bg-emerald-50 border-emerald-200 text-emerald-800',
+                          ar: 'تطابق تام',
+                          en: 'Exact Match',
+                        }
+                      : cand.matchTier === 'high'
+                      ? {
+                          cls: 'bg-teal-50 border-teal-200 text-teal-800',
+                          ar: 'ثقة عالية',
+                          en: 'High Confidence',
+                        }
+                      : {
+                          cls: 'bg-amber-50 border-amber-200 text-amber-800',
+                          ar: 'تقارب تاريخ/مبلغ',
+                          en: 'Proximity Match',
+                        };
+                  const rowBg =
+                    cand.matchTier === 'exact'
+                      ? 'bg-emerald-50/35'
+                      : cand.matchTier === 'high'
+                      ? 'bg-teal-50/25'
+                      : 'bg-amber-50/30';
+
+                  return (
+                    <div
+                      key={cand.bankTxn.id}
+                      className={`p-4 ${rowBg} flex flex-col xl:flex-row xl:items-center justify-between gap-4`}
+                    >
+                      {/* CIB Bank Line */}
+                      <div className="flex-1 min-w-0 space-y-1">
+                        <div className="flex flex-wrap items-center gap-2 text-xs">
+                          <span className="px-2 py-0.5 rounded bg-slate-900 text-white font-mono-num text-[10px] font-bold">
+                            CIB OUTFLOW
+                          </span>
+                          <span className="font-mono-num font-bold text-slate-900" dir="ltr">
+                            {cand.bankTxn.bankRef}
+                          </span>
+                          <span className="font-mono-num text-slate-500" dir="ltr">
+                            {cand.bankTxn.date}
+                          </span>
+                        </div>
+                        <div className="text-xs font-medium text-slate-800 truncate">
+                          {cand.bankTxn.description}
+                        </div>
+                        <div className="text-sm font-bold font-mono-num text-red-700" dir="ltr">
+                          −{fmtMoney(cand.bankAmount, 2)} EGP
+                        </div>
+                      </div>
+
+                      {/* Proximity Score & Reasons */}
+                      <div className="xl:w-64 shrink-0 bg-white border border-slate-200 rounded-lg p-2.5 space-y-1.5">
+                        <div className="flex items-center justify-between gap-2 text-[11px]">
+                          <span className={`px-2 py-0.5 rounded border font-bold ${tierBadge.cls}`}>
+                            {lang === 'ar' ? tierBadge.ar : tierBadge.en}
+                          </span>
+                          <span className="font-mono-num font-bold text-slate-900" dir="ltr">
+                            {cand.confidenceScore}% Score
+                          </span>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-1.5 text-[10px] font-mono-num text-slate-600" dir="ltr">
+                          <span className="px-1.5 py-0.5 rounded bg-slate-100">
+                            Δ Date: {cand.dateDiffDays >= 0 ? `+${cand.dateDiffDays}d` : `${cand.dateDiffDays}d`}
+                          </span>
+                          <span className="px-1.5 py-0.5 rounded bg-slate-100">
+                            Δ Amt: {cand.amountDiff >= 0 ? '+' : ''}
+                            {fmtMoney(cand.amountDiff, 2)} ({cand.amountDiffPct.toFixed(1)}%)
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-600">
+                          {(lang === 'ar' ? cand.reasonsAr : cand.reasonsEn).join(' · ')}
+                        </div>
+                      </div>
+
+                      {/* Candidate Open Purchase Invoice */}
+                      <div className="flex-1 min-w-0 space-y-1">
+                        <div className="flex flex-wrap items-center gap-2 text-xs">
+                          <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-200 font-mono-num text-[10px] font-bold">
+                            OPEN PO (CREDIT)
+                          </span>
+                          <span className="font-mono-num font-bold text-slate-900" dir="ltr">
+                            {cand.purchaseInvoice.purchaseNo}
+                          </span>
+                          <span className="font-mono-num text-slate-500" dir="ltr">
+                            {cand.purchaseInvoice.date}
+                          </span>
+                        </div>
+                        <div className="text-xs font-medium text-slate-800 truncate">
+                          {lang === 'ar' ? cand.purchaseInvoice.supplierNameAr : cand.supplierNameEn}
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-sm font-bold font-mono-num text-slate-900" dir="ltr">
+                            {fmtMoney(cand.invoiceAmount, 2)} EGP
+                          </span>
+                          {alts.length > 1 && (
+                            <select
+                              value={cand.purchaseInvoice.id}
+                              onChange={(e) =>
+                                setSelectedPoOverrides((prev) => ({
+                                  ...prev,
+                                  [cand.bankTxn.id]: e.target.value,
+                                }))
+                              }
+                              className="px-2 py-0.5 rounded border border-slate-300 bg-white text-[11px] text-slate-700 font-mono-num cursor-pointer"
+                              dir="ltr"
+                              aria-label={t(lang, 'تغيير الفاتورة المرشحة', 'Select alternative open PO')}
+                            >
+                              {alts.map((alt) => (
+                                <option key={alt.purchaseInvoice.id} value={alt.purchaseInvoice.id}>
+                                  {alt.purchaseInvoice.purchaseNo} ({fmtMoney(alt.invoiceAmount, 0)} EGP · {alt.confidenceScore}%)
+                                </option>
+                              ))}
+                            </select>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* CFO Approval Actions */}
+                      <div className="flex items-center gap-2 shrink-0 no-print">
+                        <button
+                          type="button"
+                          disabled={approvingMatchKey !== null}
+                          onClick={() =>
+                            handleApproveLinks(
+                              [
+                                {
+                                  bankTxnId: cand.bankTxn.id,
+                                  purchaseInvoiceId: cand.purchaseInvoice.id,
+                                },
+                              ],
+                              cand.bankTxn.id
+                            )
+                          }
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-teal-700 hover:bg-teal-800 disabled:opacity-60 text-white text-xs font-semibold whitespace-nowrap cursor-pointer transition-colors"
+                        >
+                          {approvingMatchKey === cand.bankTxn.id ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <Link2 className="w-3.5 h-3.5" />
+                          )}
+                          <span>{t(lang, 'اعتماد CFO والربط', 'CFO Approve & Link')}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setDismissedMatchBankIds((prev) =>
+                              prev.includes(cand.bankTxn.id) ? prev : [...prev, cand.bankTxn.id]
+                            )
+                          }
+                          className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 text-xs font-medium cursor-pointer transition-colors"
+                        >
+                          {t(lang, 'تجاهل', 'Dismiss')}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+
           <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+            <div className="px-5 py-3 border-b border-slate-200 bg-slate-50/70 flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-xs font-bold text-slate-900">
+                {t(lang, 'سجل حركات كشف حساب بنك CIB (حساب 1102)', 'CIB Bank Statement Ledger (Account 1102)')}
+              </h3>
+              <span className="text-[11px] text-slate-500 font-mono-num" dir="ltr">
+                {state.bankTransactions.length} {t(lang, 'حركات', 'entries')}
+              </span>
+            </div>
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
                 <thead>
@@ -341,34 +1143,85 @@ export const AccountingBankModule: React.FC<AccountingBankModuleProps> = ({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {state.bankTransactions.map((bt) => (
-                    <tr key={bt.id} className="hover:bg-slate-50">
-                      <td className="py-2.5 px-4 font-mono-num font-semibold" dir="ltr">{bt.bankRef}</td>
-                      <td className="py-2.5 px-4 font-mono-num text-slate-600" dir="ltr">{bt.date}</td>
-                      <td className="py-2.5 px-4 text-slate-800">{bt.description}</td>
-                      <td className="py-2.5 px-4 text-end font-mono-num text-red-600" dir="ltr">
-                        {bt.debit > 0 ? fmtMoney(bt.debit, 2) : '—'}
-                      </td>
-                      <td className="py-2.5 px-4 text-end font-mono-num text-emerald-700" dir="ltr">
-                        {bt.credit > 0 ? fmtMoney(bt.credit, 2) : '—'}
-                      </td>
-                      <td className="py-2.5 px-4 text-end">
-                        {bt.matchStatus === 'matched' ? (
-                          <span className="inline-flex items-center gap-1 text-emerald-700 font-medium">
-                            <CheckCircle2 className="w-3.5 h-3.5" />
-                            {t(lang, 'مطابق', 'Matched')}
-                          </span>
-                        ) : (
-                          <button
-                            onClick={() => onReconcileBank(bt.id)}
-                            className="px-3 py-1 rounded-md bg-teal-700 hover:bg-teal-800 text-white text-[11px] font-semibold"
-                          >
-                            {t(lang, 'ترحيل ومطابقة القيد', 'Post & Match Entry')}
-                          </button>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
+                  {state.bankTransactions.map((bt) => {
+                    const candidate = suggestedMatchByBankId.get(bt.id);
+                    return (
+                      <tr
+                        key={bt.id}
+                        className={candidate ? 'bg-amber-50/40 hover:bg-amber-50/70' : 'hover:bg-slate-50'}
+                      >
+                        <td className="py-2.5 px-4 font-mono-num font-semibold" dir="ltr">
+                          {bt.bankRef}
+                        </td>
+                        <td className="py-2.5 px-4 font-mono-num text-slate-600" dir="ltr">{bt.date}</td>
+                        <td className="py-2.5 px-4 text-slate-800">
+                          <div>{bt.description}</div>
+                          {candidate && (
+                            <div className="mt-1 inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-teal-50 border border-teal-200 text-teal-800 text-[10px] font-semibold">
+                              <Sparkles className="w-3 h-3" />
+                              <span>
+                                {t(
+                                  lang,
+                                  `مرشح Auto-Match: ${candidate.purchaseInvoice.purchaseNo} (${candidate.confidenceScore}%)`,
+                                  `Auto-Match Candidate: ${candidate.purchaseInvoice.purchaseNo} (${candidate.confidenceScore}%)`
+                                )}
+                              </span>
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-2.5 px-4 text-end font-mono-num text-red-600" dir="ltr">
+                          {bt.debit > 0 ? fmtMoney(bt.debit, 2) : '—'}
+                        </td>
+                        <td className="py-2.5 px-4 text-end font-mono-num text-emerald-700" dir="ltr">
+                          {bt.credit > 0 ? fmtMoney(bt.credit, 2) : '—'}
+                        </td>
+                        <td className="py-2.5 px-4 text-end">
+                          {bt.matchStatus === 'matched' ? (
+                            <span className="inline-flex items-center gap-1 text-emerald-700 font-medium">
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                              {t(lang, 'مطابق', 'Matched')}
+                            </span>
+                          ) : candidate ? (
+                            <div className="inline-flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                disabled={approvingMatchKey !== null}
+                                onClick={() =>
+                                  handleApproveLinks(
+                                    [
+                                      {
+                                        bankTxnId: bt.id,
+                                        purchaseInvoiceId: candidate.purchaseInvoice.id,
+                                      },
+                                    ],
+                                    bt.id
+                                  )
+                                }
+                                className="px-2.5 py-1 rounded-md bg-teal-700 hover:bg-teal-800 text-white text-[11px] font-semibold cursor-pointer"
+                              >
+                                {t(lang, `اعتماد ربط ${candidate.purchaseInvoice.purchaseNo}`, `Approve ${candidate.purchaseInvoice.purchaseNo}`)}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => onReconcileBank(bt.id)}
+                                className="px-2.5 py-1 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-[11px] font-medium cursor-pointer"
+                              >
+                                {t(lang, 'تسوية عامة', 'General Match')}
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => onReconcileBank(bt.id)}
+                              className="px-3 py-1 rounded-md bg-teal-700 hover:bg-teal-800 text-white text-[11px] font-semibold cursor-pointer"
+                            >
+                              {t(lang, 'ترحيل ومطابقة القيد', 'Post & Match Entry')}
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

@@ -1,12 +1,15 @@
 import React, { useMemo } from 'react';
-import { CheckSquare, Printer, Square, X } from 'lucide-react';
+import { CheckSquare, FileDown, Printer, Square, X } from 'lucide-react';
+import { CartesianGrid, Line, LineChart, ReferenceLine, XAxis } from 'recharts';
 import type { ErpState, Language } from '../types/erp';
 import {
   computeAccountBalances,
+  computeCfoVatSummary,
   computeFoodCostVarianceAnalysis,
   computeStocktakeVarianceAlerts,
   round2,
 } from '../utils/erpEngine';
+import { buildMonthlyTrendSeries } from '../utils/executivePdfBuilder';
 import { fmtMoney, fmtPct, t } from '../utils/formatters';
 import {
   loadSavedRoiInputs,
@@ -39,6 +42,7 @@ export interface CfoPrintableBriefProps {
   costCenterBudgets?: Record<'CC-HR' | 'CC-KITCHEN' | 'CC-ADMIN' | 'CC-FACILITY' | 'CC-TREASURY', number>;
   warningThresholdPct?: number;
   sections?: CfoPrintSectionId[];
+  currentViewMode?: boolean;
 }
 
 const DEFAULT_CC_BUDGETS = {
@@ -57,6 +61,7 @@ export const CfoPrintableBrief: React.FC<CfoPrintableBriefProps> = ({
   costCenterBudgets = DEFAULT_CC_BUDGETS,
   warningThresholdPct = 85,
   sections = ALL_CFO_PRINT_SECTIONS,
+  currentViewMode = false,
 }) => {
   const showSection = (id: CfoPrintSectionId) => sections.includes(id);
 
@@ -147,11 +152,10 @@ export const CfoPrintableBrief: React.FC<CfoPrintableBriefProps> = ({
     [state.ingredients]
   );
 
-  const vatOutNet = useMemo(() => {
-    const out2201 = balances['2201'] ?? 0;
-    const in1105 = balances['1105'] ?? 0;
-    return { out2201, in1105, net: round2(out2201 - in1105) };
-  }, [balances]);
+  const vatSummary = useMemo(
+    () => computeCfoVatSummary(state, period, metrics.net, balances),
+    [state, period, metrics.net, balances]
+  );
 
   const costCenterRows = useMemo(() => {
     const includeLive = period === '9m_plus_live';
@@ -238,6 +242,20 @@ export const CfoPrintableBrief: React.FC<CfoPrintableBriefProps> = ({
     () => (strat.risks ?? []).map((r, i) => normalizeRisk(r, i)),
     [strat.risks]
   );
+
+  const trendSeries = useMemo(() => {
+    const raw = buildMonthlyTrendSeries(state, excludeUsufructRent, period === '9m_plus_live');
+    return raw.map((pt) => ({
+      ...pt,
+      shortMonth: pt.month.slice(5),
+      ebitdaActive: excludeUsufructRent ? pt.ebitdaExUsufruct : pt.ebitdaInclUsufruct,
+    }));
+  }, [state, excludeUsufructRent, period]);
+
+  const latestAuditedTrend = useMemo(() => {
+    const audited = trendSeries.filter((p) => p.quarter !== 'Q4');
+    return audited[audited.length - 1] ?? trendSeries[trendSeries.length - 1];
+  }, [trendSeries]);
 
   const periodLabel = useMemo(() => {
     const map: Record<string, { ar: string; en: string }> = {
@@ -383,10 +401,108 @@ export const CfoPrintableBrief: React.FC<CfoPrintableBriefProps> = ({
             <div className="border border-slate-300 rounded-lg p-2.5">
               <div className="text-[10px] text-slate-500">{t(lang, 'صافي ضريبة القيمة المضافة', 'Net VAT Payable (14%)')}</div>
               <div className="text-sm font-bold text-teal-800 font-mono-num mt-0.5" dir="ltr">
-                {fmtMoney(vatOutNet.net, 0)} EGP
+                {fmtMoney(vatSummary.netVatPayable, 0)} EGP
               </div>
               <div className="text-[9.5px] text-slate-500 font-mono-num" dir="ltr">
-                Out {fmtMoney(vatOutNet.out2201, 0)} - In {fmtMoney(vatOutNet.in1105, 0)}
+                Out {fmtMoney(vatSummary.outputVat, 0)} - Ded {fmtMoney(vatSummary.deductibleInputVat, 0)} · Non-Ded {fmtMoney(vatSummary.nonDeductibleInputVat, 0)}
+              </div>
+            </div>
+          </div>
+
+          {/* 3-Column MoM Historical Trend Line Charts (Recharts SVG, Print-Safe Fixed Dimensions) */}
+          <div className="print-avoid-break border border-slate-300 rounded-lg p-3 bg-slate-50/50">
+            <div className="flex items-center justify-between gap-2 mb-2">
+              <h3 className="text-xs font-bold text-slate-900">
+                {t(
+                  lang,
+                  'اتجاه الأداء الشهري (MoM) — الإيرادات ومجمل الربح والـ EBITDA',
+                  'Month-over-Month Performance Trend — Revenue, Gross Profit & EBITDA'
+                )}
+              </h3>
+              {currentViewMode && (
+                <span className="px-2 py-0.5 rounded border border-teal-300 bg-teal-50 text-teal-800 text-[9.5px] font-bold">
+                  {t(lang, 'لقطة العرض النشط حالياً', 'Active Dashboard View Snapshot')}
+                </span>
+              )}
+            </div>
+            <div className="grid grid-cols-3 gap-3" dir="ltr">
+              {/* Revenue Trend */}
+              <div className="bg-white border border-slate-200 rounded-md p-2">
+                <div className="flex items-center justify-between text-[10px] mb-1">
+                  <span className="font-bold text-slate-800">Net Revenue (MoM)</span>
+                  <span className="font-mono-num font-bold text-teal-700">
+                    {latestAuditedTrend?.revMomPct !== null && latestAuditedTrend?.revMomPct !== undefined
+                      ? `${latestAuditedTrend.revMomPct > 0 ? '+' : ''}${latestAuditedTrend.revMomPct.toFixed(1)}%`
+                      : '—'}
+                  </span>
+                </div>
+                <LineChart width={205} height={82} data={trendSeries} margin={{ top: 4, right: 6, left: 6, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="2 2" stroke="#e2e8f0" />
+                  <XAxis dataKey="shortMonth" tick={{ fontSize: 8, fill: '#64748b' }} tickLine={false} axisLine={false} />
+                  <Line
+                    type="monotone"
+                    dataKey="netRevenue"
+                    stroke="#0f766e"
+                    strokeWidth={2}
+                    dot={{ r: 2, fill: '#0f766e' }}
+                    isAnimationActive={false}
+                  />
+                </LineChart>
+              </div>
+
+              {/* Gross Profit Trend */}
+              <div className="bg-white border border-slate-200 rounded-md p-2">
+                <div className="flex items-center justify-between text-[10px] mb-1">
+                  <span className="font-bold text-slate-800">Gross Profit (MoM)</span>
+                  <span className="font-mono-num font-bold text-emerald-700">
+                    {latestAuditedTrend?.gpMomPct !== null && latestAuditedTrend?.gpMomPct !== undefined
+                      ? `${latestAuditedTrend.gpMomPct > 0 ? '+' : ''}${latestAuditedTrend.gpMomPct.toFixed(1)}%`
+                      : '—'}
+                  </span>
+                </div>
+                <LineChart width={205} height={82} data={trendSeries} margin={{ top: 4, right: 6, left: 6, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="2 2" stroke="#e2e8f0" />
+                  <XAxis dataKey="shortMonth" tick={{ fontSize: 8, fill: '#64748b' }} tickLine={false} axisLine={false} />
+                  <Line
+                    type="monotone"
+                    dataKey="grossProfit"
+                    stroke="#059669"
+                    strokeWidth={2}
+                    dot={{ r: 2, fill: '#059669' }}
+                    isAnimationActive={false}
+                  />
+                </LineChart>
+              </div>
+
+              {/* EBITDA Trend */}
+              <div className="bg-white border border-slate-200 rounded-md p-2">
+                <div className="flex items-center justify-between text-[10px] mb-1">
+                  <span className="font-bold text-slate-800">
+                    {excludeUsufructRent ? 'EBITDA (Ex-Usufruct)' : 'EBITDA / Net Result'}
+                  </span>
+                  <span
+                    className={`font-mono-num font-bold ${
+                      (latestAuditedTrend?.ebitdaActive ?? 0) >= 0 ? 'text-emerald-700' : 'text-red-700'
+                    }`}
+                  >
+                    {latestAuditedTrend?.ebitdaMomPct !== null && latestAuditedTrend?.ebitdaMomPct !== undefined
+                      ? `${latestAuditedTrend.ebitdaMomPct > 0 ? '+' : ''}${latestAuditedTrend.ebitdaMomPct.toFixed(1)}%`
+                      : '—'}
+                  </span>
+                </div>
+                <LineChart width={205} height={82} data={trendSeries} margin={{ top: 4, right: 6, left: 6, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="2 2" stroke="#e2e8f0" />
+                  <XAxis dataKey="shortMonth" tick={{ fontSize: 8, fill: '#64748b' }} tickLine={false} axisLine={false} />
+                  <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="2 2" />
+                  <Line
+                    type="monotone"
+                    dataKey="ebitdaActive"
+                    stroke="#dc2626"
+                    strokeWidth={2}
+                    dot={{ r: 2, fill: '#dc2626' }}
+                    isAnimationActive={false}
+                  />
+                </LineChart>
               </div>
             </div>
           </div>
@@ -941,6 +1057,7 @@ interface CfoPrintPreviewModalProps {
   selectedSections: CfoPrintSectionId[];
   onChangeSections: (sections: CfoPrintSectionId[]) => void;
   onExecutePrint: () => void;
+  currentViewMode?: boolean;
 }
 
 export const CfoPrintPreviewModal: React.FC<CfoPrintPreviewModalProps> = ({
@@ -955,11 +1072,12 @@ export const CfoPrintPreviewModal: React.FC<CfoPrintPreviewModalProps> = ({
   selectedSections,
   onChangeSections,
   onExecutePrint,
+  currentViewMode = false,
 }) => {
   if (!open) return null;
 
   const sectionOptions: { id: CfoPrintSectionId; ar: string; en: string }[] = [
-    { id: 'exec_pnl', ar: '1. الملخص وقائمة الدخل والسيولة', en: '1. Exec Summary, P&L & Treasury' },
+    { id: 'exec_pnl', ar: '1. الملخص ومؤشرات KPI والرسوم البيانية', en: '1. KPI Cards, Trend Charts & P&L' },
     { id: 'cost_variance', ar: '2. مراكز التكلفة وانحراف الغذاء والجرد', en: '2. Cost Centers, Food Cost & Stocktake' },
     { id: 'roi_strategy', ar: '3. محاكي عائد 80% فراغ وخطة 2027', en: '3. 80% Land ROI & 2027 Scenarios' },
     { id: 'risk_signoff', ar: '4. سجل المخاطر والتوقيعات الرسمية', en: '4. Risk Register & CFO Sign-Off' },
@@ -986,22 +1104,41 @@ export const CfoPrintPreviewModal: React.FC<CfoPrintPreviewModalProps> = ({
         <div className="px-6 py-4 border-b border-slate-200 bg-slate-50/70 flex flex-wrap items-center justify-between gap-4 shrink-0">
           <div className="flex items-center gap-3">
             <div className="p-2.5 rounded-xl bg-slate-900 text-white shrink-0">
-              <Printer className="w-5 h-5" />
+              {currentViewMode ? <FileDown className="w-5 h-5" /> : <Printer className="w-5 h-5" />}
             </div>
             <div>
-              <h2 id="cfo-print-preview-title" className="text-base font-bold text-slate-900">
-                {t(
-                  lang,
-                  'معاينة حزمة تقارير CFO الجاهزة للطباعة (A4 / PDF)',
-                  'CFO Board-Ready Print Preview (A4 / PDF)'
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 id="cfo-print-preview-title" className="text-base font-bold text-slate-900">
+                  {currentViewMode
+                    ? t(
+                        lang,
+                        'تصدير العرض الحالي كـ PDF — بطاقات KPI والاتجاهات الشهرية (A4)',
+                        'Export Current View as PDF — KPI Cards & Trend Charts (A4)'
+                      )
+                    : t(
+                        lang,
+                        'معاينة حزمة تقارير CFO الجاهزة للطباعة (A4 / PDF)',
+                        'CFO Board-Ready Print Preview (A4 / PDF)'
+                      )}
+                </h2>
+                {currentViewMode && (
+                  <span className="px-2 py-0.5 rounded border border-teal-300 bg-teal-50 text-teal-800 text-[10px] font-bold">
+                    {t(lang, 'إعداد مسبق للعرض الحالي', 'Pre-Configured Current View')}
+                  </span>
                 )}
-              </h2>
+              </div>
               <p className="text-xs text-slate-500">
-                {t(
-                  lang,
-                  'تنسيق تنفيذي رسمي متعدد الصفحات يشمل قائمة الدخل، مراكز التكلفة، عائد الـ 80% فراغ، وسجل المخاطر مع خانات الاعتماد.',
-                  'Multi-page executive A4 formatting covering P&L, cost centers, 80% land ROI simulation, risk status & sign-off blocks.'
-                )}
+                {currentViewMode
+                  ? t(
+                      lang,
+                      'تم ضبط التقرير تلقائياً لالتقاط مؤشرات الأداء الحالية (KPIs) والرسوم البيانية الشهرية (الإيراد، مجمل الربح، EBITDA) حسب الفلتر النشط.',
+                      'Pre-configured to capture active KPI cards, period/usufruct filters, and Revenue/GP/EBITDA MoM trend charts in board-ready PDF format.'
+                    )
+                  : t(
+                      lang,
+                      'تنسيق تنفيذي رسمي متعدد الصفحات يشمل قائمة الدخل، مراكز التكلفة، عائد الـ 80% فراغ، وسجل المخاطر مع خانات الاعتماد.',
+                      'Multi-page executive A4 formatting covering P&L, cost centers, 80% land ROI simulation, risk status & sign-off blocks.'
+                    )}
               </p>
             </div>
           </div>
@@ -1069,6 +1206,7 @@ export const CfoPrintPreviewModal: React.FC<CfoPrintPreviewModalProps> = ({
               costCenterBudgets={costCenterBudgets}
               warningThresholdPct={warningThresholdPct}
               sections={selectedSections}
+              currentViewMode={currentViewMode}
             />
           </div>
         </div>

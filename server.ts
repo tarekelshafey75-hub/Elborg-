@@ -5,7 +5,9 @@ import { fileURLToPath } from 'url';
 import {
   loadErpStateFromDb,
   persistActiveBranchInDb,
+  persistBankAutoMatchApprovalInDb,
   persistBankReconInDb,
+  persistBankStatementImportInDb,
   persistCustomerInDb,
   persistExpenseInDb,
   persistJournalReversalInDb,
@@ -35,6 +37,15 @@ import {
   startDailyBackupScheduler,
   updateBackupConfig,
 } from './src/services/backupService.ts';
+import {
+  getAutomationRunFileForDownload,
+  getOrCreateExecutiveAutomationConfig,
+  listExecutiveAutomationRuns,
+  runMonthlyPdfArchive,
+  runWeeklyExecutiveDigest,
+  startExecutiveAutomationScheduler,
+  updateExecutiveAutomationConfig,
+} from './src/services/executiveAutomationService.ts';
 import type {
   Customer,
   ErpState,
@@ -49,6 +60,7 @@ import type {
   Supplier,
 } from './src/types/erp.ts';
 import {
+  applyBankPurchaseAutoMatchApproval,
   applyExpenseAutomation,
   applyJournalReversal,
   applyPurchaseAutomation,
@@ -548,6 +560,81 @@ async function startServer() {
     }
   });
 
+  // Import CIB Bank Statement rows into PostgreSQL
+  app.post('/api/erp/bank/import', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const { transactions } = req.body as {
+        transactions?: Array<{
+          date: string;
+          bankRef?: string;
+          description: string;
+          debit: number;
+          credit: number;
+        }>;
+      };
+      if (!Array.isArray(transactions) || transactions.length === 0) {
+        res.status(400).json({ error: 'At least one CIB statement transaction row is required.' });
+        return;
+      }
+
+      const normalized = transactions
+        .map((row) => ({
+          date: String(row.date || '').trim(),
+          bankRef: row.bankRef ? String(row.bankRef).trim() : undefined,
+          description: String(row.description || '').trim() || 'حركة كشف حساب بنك CIB',
+          debit: Math.max(0, Number(row.debit) || 0),
+          credit: Math.max(0, Number(row.credit) || 0),
+        }))
+        .filter((row) => row.debit > 0 || row.credit > 0);
+
+      if (normalized.length === 0) {
+        res.status(400).json({ error: 'No valid debit or credit amounts found in statement rows.' });
+        return;
+      }
+
+      const result = await persistBankStatementImportInDb(normalized, req.user?.uid);
+      broadcastStateUpdate('bank_reconciled', { imported: result.insertedCount });
+      res.status(201).json(result);
+    } catch (error: any) {
+      console.error('Error importing CIB bank statement:', error);
+      res.status(500).json({ error: error?.message || 'Failed to import CIB bank statement' });
+    }
+  });
+
+  // CFO Approval for Auto-Matched CIB Bank Statements <-> Open Purchase Invoices
+  app.post('/api/erp/bank/auto-match/approve', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const { links } = req.body as {
+        links?: Array<{ bankTxnId: string; purchaseInvoiceId: string }>;
+      };
+      if (!Array.isArray(links) || links.length === 0) {
+        res.status(400).json({ error: 'At least one bank-to-purchase link is required.' });
+        return;
+      }
+
+      const currentState = await loadErpStateFromDb();
+      const approver = req.user?.email || 'المدير المالي (CFO)';
+      const { nextState, journals, approvedPairs } = applyBankPurchaseAutoMatchApproval(
+        currentState,
+        links,
+        approver
+      );
+
+      if (approvedPairs.length === 0) {
+        res.status(400).json({ error: 'No eligible unmatched CIB outflow & open credit purchase invoice pairs found.' });
+        return;
+      }
+
+      await persistBankAutoMatchApprovalInDb(nextState, journals, approvedPairs, req.user?.uid);
+      const reloadedState = await loadErpStateFromDb();
+      broadcastStateUpdate('bank_reconciled', { approvedCount: approvedPairs.length });
+      res.json({ state: reloadedState, approvedCount: approvedPairs.length });
+    } catch (error: any) {
+      console.error('Error approving bank auto-match:', error);
+      res.status(500).json({ error: error?.message || 'Failed to approve bank auto-match links' });
+    }
+  });
+
   // Foodics API Webhook Simulation
   app.post('/api/erp/integrations/foodics', requireAuth, async (req: AuthRequest, res) => {
     try {
@@ -736,6 +823,98 @@ async function startServer() {
     } catch (error: any) {
       console.error('Error downloading snapshot:', error);
       res.status(404).json({ error: error?.message || 'Snapshot archive not found' });
+    }
+  });
+
+  // Executive Automation: Monthly Financial Performance Summary PDF Archive & Weekly Emailable Digest
+  app.get('/api/erp/automation/status', requireAuth, async (_req: AuthRequest, res) => {
+    try {
+      const [config, runs] = await Promise.all([
+        getOrCreateExecutiveAutomationConfig(),
+        listExecutiveAutomationRuns(25),
+      ]);
+      res.json({ config, runs });
+    } catch (error: any) {
+      console.error('Error loading automation status:', error);
+      res.status(500).json({ error: error?.message || 'Failed to load automation status' });
+    }
+  });
+
+  app.patch('/api/erp/automation/config', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const body = (req.body || {}) as Record<string, unknown>;
+      const config = await updateExecutiveAutomationConfig({
+        gcsBucketName: typeof body.gcsBucketName === 'string' ? body.gcsBucketName : undefined,
+        monthlyFolderPrefix: typeof body.monthlyFolderPrefix === 'string' ? body.monthlyFolderPrefix : undefined,
+        monthlyPdfEnabled: typeof body.monthlyPdfEnabled === 'boolean' ? body.monthlyPdfEnabled : undefined,
+        monthlyDayOfMonth: body.monthlyDayOfMonth !== undefined ? Number(body.monthlyDayOfMonth) : undefined,
+        monthlyHour: body.monthlyHour !== undefined ? Number(body.monthlyHour) : undefined,
+        timezone: typeof body.timezone === 'string' ? body.timezone : undefined,
+        weeklyDigestEnabled: typeof body.weeklyDigestEnabled === 'boolean' ? body.weeklyDigestEnabled : undefined,
+        weeklyDayOfWeek: body.weeklyDayOfWeek !== undefined ? Number(body.weeklyDayOfWeek) : undefined,
+        weeklyHour: body.weeklyHour !== undefined ? Number(body.weeklyHour) : undefined,
+        weeklyRecipientEmail: typeof body.weeklyRecipientEmail === 'string' ? body.weeklyRecipientEmail : undefined,
+        weeklyCcEmails: typeof body.weeklyCcEmails === 'string' ? body.weeklyCcEmails : undefined,
+        weeklyIncludePdf: typeof body.weeklyIncludePdf === 'boolean' ? body.weeklyIncludePdf : undefined,
+      });
+      res.json({ config });
+    } catch (error: any) {
+      console.error('Error updating automation config:', error);
+      res.status(500).json({ error: error?.message || 'Failed to update automation configuration' });
+    }
+  });
+
+  app.post('/api/erp/automation/monthly-pdf/run', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const run = await runMonthlyPdfArchive({
+        triggerType: 'manual',
+        triggeredBy: req.user?.email || 'Authenticated CFO',
+      });
+      const config = await getOrCreateExecutiveAutomationConfig();
+      res.status(201).json({ run, config });
+    } catch (error: any) {
+      console.error('Monthly PDF archive run failed:', error);
+      res.status(500).json({ error: error?.message || 'Failed to archive monthly Financial Performance Summary PDF' });
+    }
+  });
+
+  app.post('/api/erp/automation/weekly-digest/run', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const run = await runWeeklyExecutiveDigest({
+        triggerType: 'manual',
+        triggeredBy: req.user?.email || 'Authenticated CFO',
+      });
+      const config = await getOrCreateExecutiveAutomationConfig();
+      res.status(201).json({ run, config });
+    } catch (error: any) {
+      console.error('Weekly digest bundle run failed:', error);
+      res.status(500).json({ error: error?.message || 'Failed to generate weekly executive digest bundle' });
+    }
+  });
+
+  app.get('/api/erp/automation/runs/:id/download', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const file = await getAutomationRunFileForDownload(req.params.id, 'pdf');
+      const safeName = path.basename(file.filename).replace(/[^a-zA-Z0-9._-]/g, '_');
+      res.setHeader('Content-Type', file.contentType);
+      res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+      res.send(file.buffer);
+    } catch (error: any) {
+      console.error('Error downloading automation PDF:', error);
+      res.status(404).json({ error: error?.message || 'Archived PDF not found' });
+    }
+  });
+
+  app.get('/api/erp/automation/runs/:id/eml', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const file = await getAutomationRunFileForDownload(req.params.id, 'eml');
+      const safeName = path.basename(file.filename).replace(/[^a-zA-Z0-9._-]/g, '_');
+      res.setHeader('Content-Type', file.contentType);
+      res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+      res.send(file.buffer);
+    } catch (error: any) {
+      console.error('Error downloading automation EML:', error);
+      res.status(404).json({ error: error?.message || 'Weekly digest EML bundle not found' });
     }
   });
 
@@ -1072,6 +1251,7 @@ async function startServer() {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Estadat Al-Borg ERP server running on http://localhost:${PORT}`);
     startDailyBackupScheduler();
+    startExecutiveAutomationScheduler();
   });
 }
 

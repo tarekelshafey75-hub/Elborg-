@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Building2,
   CheckCircle2,
@@ -24,16 +24,17 @@ import { computeStocktakeVarianceAlerts } from '../utils/erpEngine';
 import { fmtMoney, t } from '../utils/formatters';
 import { RiskRegisterPanel } from './RiskRegisterPanel';
 
+export type ReviewSubTab = 'exec' | 'financials' | 'operations' | 'usufruct' | 'risks' | 'report_pdf';
+
 interface CfoExecutiveReviewModuleProps {
   state: ErpState;
   lang: Language;
+  initialSubTab?: ReviewSubTab;
   onNavigate?: (tab: 'dashboard' | 'strategy' | 'accounting' | 'inventory' | 'purchases') => void;
   onCreateRisk?: (risk: Partial<StrategyRisk>) => Promise<void>;
   onUpdateRisk?: (id: string, patch: Partial<StrategyRisk> & { auditNote?: string }) => Promise<void>;
   onDeleteRisk?: (id: string) => Promise<void>;
 }
-
-type ReviewSubTab = 'exec' | 'financials' | 'operations' | 'usufruct' | 'risks' | 'report_pdf';
 
 function StatusBadge({
   status,
@@ -73,12 +74,19 @@ function StatusBadge({
 export const CfoExecutiveReviewModule: React.FC<CfoExecutiveReviewModuleProps> = ({
   state,
   lang,
+  initialSubTab,
   onNavigate,
   onCreateRisk,
   onUpdateRisk,
   onDeleteRisk,
 }) => {
-  const [subTab, setSubTab] = useState<ReviewSubTab>('exec');
+  const [subTab, setSubTab] = useState<ReviewSubTab>(initialSubTab ?? 'exec');
+
+  useEffect(() => {
+    if (initialSubTab) {
+      setSubTab(initialSubTab);
+    }
+  }, [initialSubTab]);
   const [totalSiteSqm, setTotalSiteSqm] = useState<number>(29781.8);
   const [usedPct, setUsedPct] = useState<number>(20);
   const [discountRatePct, setDiscountRatePct] = useState<number>(22);

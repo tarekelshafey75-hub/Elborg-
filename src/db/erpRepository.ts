@@ -1563,6 +1563,80 @@ export async function persistBankReconInDb(
   }
 }
 
+export async function persistBankAutoMatchApprovalInDb(
+  nextState: ErpState,
+  journals: JournalEntry[],
+  approvedPairs: Array<{
+    bankTxnId: string;
+    purchaseInvoiceId: string;
+    journalId: string;
+  }>,
+  actorUid?: string
+): Promise<void> {
+  if (approvedPairs.length === 0) return;
+  try {
+    await db.transaction(async (tx) => {
+      await tx
+        .update(erpMetadata)
+        .set({ suppliers: nextState.suppliers, updatedAt: new Date() })
+        .where(eq(erpMetadata.id, METADATA_ROW_ID));
+
+      for (const journal of journals) {
+        await tx.insert(journalEntries).values({
+          id: journal.id,
+          journalNo: journal.journalNo,
+          date: journal.date,
+          period: journal.period,
+          source: journal.source,
+          referenceNo: journal.referenceNo,
+          description: journal.description,
+          createdBy: journal.createdBy,
+          isReversed: false,
+          reversalOfId: null,
+          reversedByJournalId: null,
+          lines: journal.lines,
+          createdByUid: actorUid ?? null,
+        });
+      }
+
+      for (const pair of approvedPairs) {
+        await tx
+          .update(bankTransactions)
+          .set({
+            matchStatus: 'matched',
+            matchedJournalId: pair.journalId,
+          })
+          .where(eq(bankTransactions.id, pair.bankTxnId));
+
+        await tx
+          .update(purchaseInvoices)
+          .set({
+            paymentStatus: 'paid_cib',
+          })
+          .where(eq(purchaseInvoices.id, pair.purchaseInvoiceId));
+      }
+
+      const newAudits = nextState.auditLogs.slice(0, approvedPairs.length);
+      for (const audit of newAudits) {
+        await tx.insert(auditLogs).values({
+          id: audit.id,
+          timestamp: audit.timestamp,
+          actor: audit.user,
+          role: audit.role,
+          action: audit.action,
+          entityType: audit.entityType,
+          entityId: audit.entityId,
+          details: audit.details,
+          actorUid: actorUid ?? null,
+        });
+      }
+    });
+  } catch (error) {
+    console.error('Failed to persist bank auto-match approval:', error);
+    throw new Error('Failed to save CFO bank auto-match approval.', { cause: error });
+  }
+}
+
 export async function persistPartnersDemoSeedInDb(): Promise<ErpState> {
   try {
     const seed = createSeedErpState();

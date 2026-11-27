@@ -368,3 +368,45 @@ export const backupSnapshots = pgTable('backup_snapshots', {
   triggeredBy: text('triggered_by').notNull(),
   errorMessage: text('error_message'),
 });
+
+export const executiveAutomationConfigs = pgTable('executive_automation_configs', {
+  id: text('id').primaryKey(),
+  gcsBucketName: text('gcs_bucket_name').notNull(),
+  monthlyFolderPrefix: text('monthly_folder_prefix').notNull(),
+  monthlyPdfEnabled: boolean('monthly_pdf_enabled').notNull().default(true),
+  monthlyDayOfMonth: integer('monthly_day_of_month').notNull().default(1),
+  monthlyHour: integer('monthly_hour').notNull().default(6),
+  timezone: text('timezone').notNull().default('Africa/Cairo'),
+  weeklyDigestEnabled: boolean('weekly_digest_enabled').notNull().default(false),
+  weeklyDayOfWeek: integer('weekly_day_of_week').notNull().default(0),
+  weeklyHour: integer('weekly_hour').notNull().default(8),
+  weeklyRecipientEmail: text('weekly_recipient_email').notNull().default('tarek.elshafey75@gmail.com'),
+  weeklyCcEmails: text('weekly_cc_emails').notNull().default(''),
+  weeklyIncludePdf: boolean('weekly_include_pdf').notNull().default(true),
+  updatedAt: timestamp('updated_at').defaultNow(),
+});
+
+export const executiveAutomationRuns = pgTable('executive_automation_runs', {
+  id: text('id').primaryKey(),
+  runType: text('run_type').notNull(),
+  createdAt: text('created_at').notNull(),
+  periodKey: text('period_key').notNull(),
+  triggerType: text('trigger_type').notNull(),
+  triggeredBy: text('triggered_by').notNull(),
+  status: text('status').notNull(),
+  storageMode: text('storage_mode').notNull(),
+  bucketName: text('bucket_name').notNull(),
+  objectPath: text('object_path').notNull(),
+  gcsUri: text('gcs_uri').notNull(),
+  localFilePath: text('local_file_path'),
+  emlFilePath: text('eml_file_path'),
+  fileSizeBytes: integer('file_size_bytes').notNull().default(0),
+  checksumSha256: text('checksum_sha256').notNull().default(''),
+  recipientEmail: text('recipient_email'),
+  emailSubject: text('email_subject'),
+  emailHtmlPreview: text('email_html_preview'),
+  kpiSnapshot: jsonb('kpi_snapshot').$type<Record<string, unknown>>(),
+  riskSnapshot: jsonb('risk_snapshot').$type<Record<string, unknown>>(),
+  errorMessage: text('error_message'),
+});
+

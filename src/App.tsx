@@ -7,7 +7,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { AlertTriangle, CheckCircle2, Circle, Database, Loader2, ShieldCheck, X } from 'lucide-react';
 import { AccountingBankModule } from './components/AccountingBankModule';
 import { CfoDashboard } from './components/CfoDashboard';
-import { CfoExecutiveReviewModule } from './components/CfoExecutiveReviewModule';
+import { CfoExecutiveReviewModule, type ReviewSubTab } from './components/CfoExecutiveReviewModule';
 import { DataQualityExportModule } from './components/DataQualityExportModule';
 import { InventoryMenuModule } from './components/InventoryMenuModule';
 import { InvestmentRoiSimulatorModule } from './components/InvestmentRoiSimulatorModule';
@@ -34,9 +34,11 @@ import {
   WasteEntry,
 } from './types/erp';
 import {
+  applyBankPurchaseAutoMatchApproval,
   applySaleAutomation,
   applyStocktakeEntryAutomation,
   applyStocktakeReconciliationAutomation,
+  computeBankRunningBalances,
   computeStockOpportunityAlerts,
   exportErpWorkbook,
   PurchaseRequestPayload,
@@ -155,6 +157,7 @@ function ErpWorkspace({
     subTab: 'stock' | 'recipes' | 'waste' | 'stocktake';
     stocktakeId?: string | null;
   } | null>(null);
+  const [cfoReviewFocus, setCfoReviewFocus] = useState<ReviewSubTab | null>(null);
   const [offlineQueue, setOfflineQueue] = useState<SaleRequestPayload[]>(() => {
     try {
       const saved = localStorage.getItem(OFFLINE_QUEUE_KEY);
@@ -735,6 +738,111 @@ function ErpWorkspace({
     }
   };
 
+  const handleImportBankStatements = async (
+    transactions: Array<{
+      date: string;
+      bankRef?: string;
+      description: string;
+      debit: number;
+      credit: number;
+    }>
+  ): Promise<{ insertedCount: number; skippedCount: number }> => {
+    if (isOffline) {
+      let insertedCount = 0;
+      let skippedCount = 0;
+      setErpState((prev) => {
+        const existingRefs = new Set(prev.bankTransactions.map((b) => b.bankRef.trim().toUpperCase()));
+        const additions = [...prev.bankTransactions];
+        transactions.forEach((row, idx) => {
+          const ref = (row.bankRef || `CIB-IMP-${Date.now()}-${idx + 1}`).trim();
+          if (existingRefs.has(ref.toUpperCase())) {
+            skippedCount++;
+            return;
+          }
+          existingRefs.add(ref.toUpperCase());
+          additions.push({
+            id: `BNK-IMP-${Date.now()}-${idx + 1}`,
+            bankRef: ref,
+            date: row.date,
+            description: row.description,
+            debit: Number(row.debit) || 0,
+            credit: Number(row.credit) || 0,
+            accountCode: '1102',
+            matchStatus: 'unmatched',
+          });
+          insertedCount++;
+        });
+        return { ...prev, bankTransactions: computeBankRunningBalances(additions) };
+      });
+      return { insertedCount, skippedCount };
+    }
+
+    try {
+      const res = await authFetch('/api/erp/bank/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transactions }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        setApiErrorBanner(
+          err?.error || (lang === 'ar' ? 'تعذر استيراد كشف بنك CIB.' : 'Failed to import CIB statement rows.')
+        );
+        return { insertedCount: 0, skippedCount: 0 };
+      }
+      const data = await res.json();
+      if (data.state) setErpState(data.state);
+      setApiErrorBanner(null);
+      return {
+        insertedCount: Number(data.insertedCount) || 0,
+        skippedCount: Number(data.skippedCount) || 0,
+      };
+    } catch {
+      setApiErrorBanner(lang === 'ar' ? 'تعذر الاتصال بالخادم لاستيراد كشف CIB.' : 'Network error importing CIB statement.');
+      return { insertedCount: 0, skippedCount: 0 };
+    }
+  };
+
+  const handleApproveBankAutoMatches = async (
+    links: Array<{ bankTxnId: string; purchaseInvoiceId: string }>
+  ): Promise<number> => {
+    if (links.length === 0) return 0;
+
+    if (isOffline) {
+      const { nextState, approvedPairs } = applyBankPurchaseAutoMatchApproval(
+        erpState,
+        links,
+        user?.email || 'المدير المالي (CFO)'
+      );
+      setErpState(nextState);
+      return approvedPairs.length;
+    }
+
+    try {
+      const res = await authFetch('/api/erp/bank/auto-match/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ links }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        setApiErrorBanner(
+          err?.error || (lang === 'ar' ? 'تعذر اعتماد مطابقة كشف CIB.' : 'Failed to approve bank auto-match.')
+        );
+        return 0;
+      }
+      const data = await res.json();
+      if (data.state) setErpState(data.state);
+      setApiErrorBanner(null);
+      return Number(data.approvedCount) || links.length;
+    } catch {
+      setApiErrorBanner(
+        lang === 'ar' ? 'تعذر الاتصال بالخادم لاعتماد المطابقة.' : 'Network error approving bank auto-match.'
+      );
+      return 0;
+    }
+  };
+
   const handleRecordExpense = async (payload: {
     categoryAccountCode: string;
     beneficiary: string;
@@ -970,7 +1078,14 @@ function ErpWorkspace({
             <CfoDashboard
               state={erpState}
               lang={lang}
-              onNavigate={(t) => setActiveTab(t)}
+              onNavigate={(t) => {
+                if (t === 'cfo_review') setCfoReviewFocus(null);
+                setActiveTab(t);
+              }}
+              onOpenPerformanceReview={() => {
+                setCfoReviewFocus('financials');
+                setActiveTab('cfo_review');
+              }}
               onQuickReorder={(payload) => {
                 setPrefillPurchase(payload);
                 setActiveTab('purchases');
@@ -989,6 +1104,7 @@ function ErpWorkspace({
             <CfoExecutiveReviewModule
               state={erpState}
               lang={lang}
+              initialSubTab={cfoReviewFocus ?? undefined}
               onNavigate={(t) => setActiveTab(t)}
               onCreateRisk={handleCreateRisk}
               onUpdateRisk={handleUpdateRisk}
@@ -1056,6 +1172,8 @@ function ErpWorkspace({
               onReverseJournal={handleReverseJournal}
               onReconcileBank={handleReconcileBank}
               onRecordExpense={handleRecordExpense}
+              onImportBankStatements={handleImportBankStatements}
+              onApproveBankAutoMatches={handleApproveBankAutoMatches}
             />
           )}
           {activeTab === 'quality' && (

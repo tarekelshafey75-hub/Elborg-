@@ -3,14 +3,17 @@ import * as XLSX from 'xlsx';
 import {
   AlertTriangle,
   Archive,
+  CalendarClock,
   CheckCircle2,
   CloudUpload,
   Database,
   Download,
   FileCode2,
   FileSpreadsheet,
+  FileText,
   HardDrive,
   Loader2,
+  Mail,
   Play,
   Printer,
   RefreshCw,
@@ -68,6 +71,44 @@ interface DbExportSummary {
   };
 }
 
+interface ExecutiveAutomationConfigView {
+  id: string;
+  gcsBucketName: string;
+  monthlyFolderPrefix: string;
+  monthlyPdfEnabled: boolean;
+  monthlyDayOfMonth: number;
+  monthlyHour: number;
+  timezone: string;
+  weeklyDigestEnabled: boolean;
+  weeklyDayOfWeek: number;
+  weeklyHour: number;
+  weeklyRecipientEmail: string;
+  weeklyCcEmails: string;
+  weeklyIncludePdf: boolean;
+}
+
+interface ExecutiveAutomationRunView {
+  id: string;
+  runType: 'monthly_pdf' | 'weekly_digest';
+  createdAt: string;
+  periodKey: string;
+  triggerType: string;
+  triggeredBy: string;
+  status: string;
+  storageMode: 'gcs' | 'local_archive';
+  bucketName: string;
+  objectPath: string;
+  gcsUri: string;
+  fileSizeBytes: number;
+  checksumSha256: string;
+  recipientEmail: string | null;
+  emailSubject: string | null;
+  emailHtmlPreview: string | null;
+  kpiSnapshot: Record<string, any> | null;
+  riskSnapshot: Record<string, any> | null;
+  errorMessage: string | null;
+}
+
 interface DataQualityExportModuleProps {
   state: ErpState;
   lang: Language;
@@ -86,7 +127,7 @@ export const DataQualityExportModule: React.FC<DataQualityExportModuleProps> = (
   onOpenPrintCenter,
 }) => {
   const { authFetch } = useAuth();
-  const [subTab, setSubTab] = useState<'dq' | 'backups' | 'excel' | 'audit' | 'architecture'>('dq');
+  const [subTab, setSubTab] = useState<'dq' | 'backups' | 'automation' | 'excel' | 'audit' | 'architecture'>('dq');
   const [importedPreview, setImportedPreview] = useState<{ sheetName: string; headers: string[]; rows: unknown[][] } | null>(null);
   const [backupConfig, setBackupConfig] = useState<BackupConfigView | null>(null);
   const [backupSnapshots, setBackupSnapshots] = useState<BackupSnapshotView[]>([]);
@@ -94,6 +135,15 @@ export const DataQualityExportModule: React.FC<DataQualityExportModuleProps> = (
   const [backupRunning, setBackupRunning] = useState(false);
   const [backupSaving, setBackupSaving] = useState(false);
   const [backupFeedback, setBackupFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  const [autoConfig, setAutoConfig] = useState<ExecutiveAutomationConfigView | null>(null);
+  const [autoRuns, setAutoRuns] = useState<ExecutiveAutomationRunView[]>([]);
+  const [autoLoading, setAutoLoading] = useState(false);
+  const [autoSaving, setAutoSaving] = useState(false);
+  const [monthlyPdfRunning, setMonthlyPdfRunning] = useState(false);
+  const [weeklyDigestRunning, setWeeklyDigestRunning] = useState(false);
+  const [autoFeedback, setAutoFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [previewDigestId, setPreviewDigestId] = useState<string | null>(null);
 
   const [dbSummary, setDbSummary] = useState<DbExportSummary | null>(null);
   const [dbSummaryLoading, setDbSummaryLoading] = useState(false);
@@ -136,14 +186,42 @@ export const DataQualityExportModule: React.FC<DataQualityExportModuleProps> = (
     }
   }, [authFetch]);
 
+  const loadAutomationStatus = useCallback(async () => {
+    setAutoLoading(true);
+    try {
+      const res = await authFetch('/api/erp/automation/status');
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.config) setAutoConfig(data.config);
+        if (Array.isArray(data?.runs)) {
+          setAutoRuns(data.runs);
+          const firstDigest = data.runs.find((r: ExecutiveAutomationRunView) => r.runType === 'weekly_digest');
+          if (firstDigest) {
+            setPreviewDigestId((curr) => curr ?? firstDigest.id);
+          }
+        }
+      }
+    } catch {
+      setAutoFeedback({
+        type: 'err',
+        text: t(lang, 'تعذر تحميل إعدادات الأتمتة والتقارير المجدولة.', 'Unable to load scheduled PDF & digest status.'),
+      });
+    } finally {
+      setAutoLoading(false);
+    }
+  }, [authFetch, lang]);
+
   useEffect(() => {
     if (subTab === 'backups') {
       loadBackupStatus();
     }
+    if (subTab === 'automation') {
+      loadAutomationStatus();
+    }
     if (subTab === 'excel' || subTab === 'dq') {
       loadDbExportSummary();
     }
-  }, [subTab, loadBackupStatus, loadDbExportSummary]);
+  }, [subTab, loadBackupStatus, loadAutomationStatus, loadDbExportSummary]);
 
   const handleExportFullDatabase = async (format: 'zip' | 'json-zip' | 'json' | 'csv') => {
     setExportingFormat(format);
@@ -286,6 +364,141 @@ export const DataQualityExportModule: React.FC<DataQualityExportModuleProps> = (
     }
   };
 
+  const persistAutomationPatch = async (patch: Partial<ExecutiveAutomationConfigView>, successText?: string) => {
+    setAutoSaving(true);
+    setAutoFeedback(null);
+    try {
+      const res = await authFetch('/api/erp/automation/config', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      if (!res.ok) throw new Error('Failed to save automation config');
+      const data = await res.json();
+      if (data?.config) setAutoConfig(data.config);
+      if (successText) {
+        setAutoFeedback({ type: 'ok', text: successText });
+      }
+    } catch {
+      setAutoFeedback({
+        type: 'err',
+        text: t(lang, 'تعذر حفظ إعدادات الجدولة التنفيذية.', 'Unable to save scheduled automation settings.'),
+      });
+    } finally {
+      setAutoSaving(false);
+    }
+  };
+
+  const handleToggleWeeklyDigest = async () => {
+    if (!autoConfig) return;
+    const nextVal = !autoConfig.weeklyDigestEnabled;
+    setAutoConfig({ ...autoConfig, weeklyDigestEnabled: nextVal });
+    await persistAutomationPatch(
+      { weeklyDigestEnabled: nextVal },
+      nextVal
+        ? t(
+            lang,
+            'تم تفعيل جدولة الملخص الأسبوعي التنفيذي وتجهيز البريد المرفق بالـ PDF.',
+            'Schedule Weekly Digest enabled — weekly KPIs & Risk updates will bundle with PDF.'
+          )
+        : t(lang, 'تم إيقاف جدولة الملخص الأسبوعي مؤقتاً.', 'Weekly Digest schedule paused.')
+    );
+  };
+
+  const handleRunMonthlyPdfArchive = async () => {
+    setMonthlyPdfRunning(true);
+    setAutoFeedback(null);
+    try {
+      const res = await authFetch('/api/erp/automation/monthly-pdf/run', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok || !data?.run) {
+        throw new Error(data?.error || 'Monthly PDF generation failed');
+      }
+      setAutoRuns((prev) => [data.run, ...prev.filter((r) => r.id !== data.run.id)]);
+      if (data.config) setAutoConfig(data.config);
+      setAutoFeedback({
+        type: 'ok',
+        text:
+          data.run.storageMode === 'gcs'
+            ? t(
+                lang,
+                `تم توليد ملف ملخص الأداء المالي PDF وأرشفته في Cloud Storage: ${data.run.gcsUri}`,
+                `Generated Financial Performance Summary PDF and archived to ${data.run.gcsUri}`
+              )
+            : t(
+                lang,
+                `تم توليد ملخص الأداء المالي PDF (${data.run.id}) وحفظه في الأرشيف المحلي الجاهز للرفع السحابي.`,
+                `Generated Financial Performance Summary PDF (${data.run.id}) & archived locally (GCS bucket pending).`
+              ),
+      });
+    } catch (err: any) {
+      setAutoFeedback({
+        type: 'err',
+        text: err?.message || t(lang, 'فشل توليد وأرشفة ملف PDF الشهري.', 'Monthly PDF generation failed.'),
+      });
+    } finally {
+      setMonthlyPdfRunning(false);
+    }
+  };
+
+  const handleRunWeeklyDigestNow = async () => {
+    setWeeklyDigestRunning(true);
+    setAutoFeedback(null);
+    try {
+      const res = await authFetch('/api/erp/automation/weekly-digest/run', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok || !data?.run) {
+        throw new Error(data?.error || 'Weekly digest generation failed');
+      }
+      setAutoRuns((prev) => [data.run, ...prev.filter((r) => r.id !== data.run.id)]);
+      setPreviewDigestId(data.run.id);
+      if (data.config) setAutoConfig(data.config);
+      setAutoFeedback({
+        type: 'ok',
+        text: t(
+          lang,
+          `تم تجميع الملخص الأسبوعي (${data.run.id}) مع مرفق PDF وتحديثات المخاطر الجاهز للبريد: ${data.run.recipientEmail}`,
+          `Weekly Digest bundle (${data.run.id}) ready for ${data.run.recipientEmail} with attached Financial Performance Summary PDF.`
+        ),
+      });
+    } catch (err: any) {
+      setAutoFeedback({
+        type: 'err',
+        text: err?.message || t(lang, 'فشل تجهيز حزمة الملخص الأسبوعي.', 'Weekly digest bundling failed.'),
+      });
+    } finally {
+      setWeeklyDigestRunning(false);
+    }
+  };
+
+  const handleDownloadAutomationAsset = async (runId: string, kind: 'pdf' | 'eml') => {
+    try {
+      const endpoint =
+        kind === 'pdf'
+          ? `/api/erp/automation/runs/${encodeURIComponent(runId)}/download`
+          : `/api/erp/automation/runs/${encodeURIComponent(runId)}/eml`;
+      const res = await authFetch(endpoint);
+      if (!res.ok) throw new Error('Download failed');
+      const disp = res.headers.get('Content-Disposition') || '';
+      const match = disp.match(/filename="([^"]+)"/);
+      const fallbackName = kind === 'pdf' ? `${runId}_Financial_Performance_Summary.pdf` : `${runId}_Weekly_Digest.eml`;
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = match?.[1] || fallbackName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch {
+      setAutoFeedback({
+        type: 'err',
+        text: t(lang, 'تعذر تحميل الملف المطلوب من الأرشيف.', 'Unable to download archived report asset.'),
+      });
+    }
+  };
+
   const handleFileImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -363,6 +576,7 @@ export const DataQualityExportModule: React.FC<DataQualityExportModuleProps> = (
             {(
               [
                 { id: 'dq', ar: 'فحص جودة البيانات', en: 'Data Quality' },
+                { id: 'automation', ar: 'تقارير PDF والملخص الأسبوعي', en: 'Scheduled PDF & Digest' },
                 { id: 'backups', ar: 'النسخ الاحتياطي Cloud Storage', en: 'Cloud Backups & DR' },
                 { id: 'excel', ar: 'التصدير الشامل و ETL', en: 'Full Export & ETL' },
                 { id: 'audit', ar: 'سجل التدقيق', en: 'Audit Trail' },
@@ -721,6 +935,496 @@ export const DataQualityExportModule: React.FC<DataQualityExportModuleProps> = (
         </div>
       )}
 
+      {/* TAB 1C: MONTHLY FINANCIAL PERFORMANCE SUMMARY PDF ARCHIVAL & WEEKLY EMAILABLE DIGEST */}
+      {subTab === 'automation' && (
+        <div className="space-y-6">
+          {autoFeedback && (
+            <div
+              className={`p-3.5 rounded-xl border text-xs flex items-center gap-2 ${
+                autoFeedback.type === 'ok'
+                  ? 'bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-900 dark:text-emerald-200'
+                  : 'bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-800 text-red-800 dark:text-red-200'
+              }`}
+            >
+              {autoFeedback.type === 'ok' ? (
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+              ) : (
+                <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+              )}
+              <span>{autoFeedback.text}</span>
+            </div>
+          )}
+
+          {/* CARD 1: MONTHLY FINANCIAL PERFORMANCE SUMMARY PDF ARCHIVAL */}
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 space-y-4">
+            <div className="flex flex-wrap items-start justify-between gap-4">
+              <div>
+                <h2 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                  <CalendarClock className="w-4 h-4 text-teal-700 dark:text-teal-400" />
+                  {t(
+                    lang,
+                    'الأرشفة الشهرية التلقائية لتقرير "ملخص الأداء المالي" PDF في Cloud Storage',
+                    'Scheduled Monthly "Financial Performance Summary" PDF Cloud Archival'
+                  )}
+                </h2>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                  {t(
+                    lang,
+                    'مهمة مجدولة شهرياً تولد تقرير Financial Performance Summary بصيغة PDF وترفعه تلقائياً إلى المجلد المخصص في Cloud Storage للأرشفة التنفيذية.',
+                    'Monthly scheduled task that generates a board-ready Financial Performance Summary PDF and archives it into your designated Cloud Storage folder.'
+                  )}
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={loadAutomationStatus}
+                  disabled={autoLoading}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${autoLoading ? 'animate-spin' : ''}`} />
+                  <span>{t(lang, 'تحديث', 'Refresh')}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleRunMonthlyPdfArchive}
+                  disabled={monthlyPdfRunning}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-teal-700 hover:bg-teal-800 disabled:opacity-60 text-white text-xs font-semibold cursor-pointer transition-colors"
+                >
+                  {monthlyPdfRunning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileText className="w-3.5 h-3.5" />}
+                  <span>
+                    {monthlyPdfRunning
+                      ? t(lang, 'جاري التوليد والأرشفة...', 'Generating PDF...')
+                      : t(lang, 'توليد وأرشفة PDF الشهري الآن', 'Run Monthly PDF Archive Now')}
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            {autoConfig && (
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void persistAutomationPatch(
+                    {
+                      gcsBucketName: autoConfig.gcsBucketName,
+                      monthlyFolderPrefix: autoConfig.monthlyFolderPrefix,
+                      monthlyDayOfMonth: autoConfig.monthlyDayOfMonth,
+                      monthlyHour: autoConfig.monthlyHour,
+                      monthlyPdfEnabled: autoConfig.monthlyPdfEnabled,
+                    },
+                    t(lang, 'تم حفظ إعدادات الأرشفة الشهرية لتقرير PDF.', 'Monthly PDF archival schedule saved.')
+                  );
+                }}
+                className="grid grid-cols-1 md:grid-cols-5 gap-3 pt-3 border-t border-slate-100 dark:border-slate-800"
+              >
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 dark:text-slate-300 mb-1">
+                    {t(lang, 'حاوية Cloud Storage (Bucket)', 'GCS Bucket Name')}
+                  </label>
+                  <input
+                    type="text"
+                    value={autoConfig.gcsBucketName}
+                    onChange={(e) => setAutoConfig({ ...autoConfig, gcsBucketName: e.target.value })}
+                    className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-mono-num"
+                    dir="ltr"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 dark:text-slate-300 mb-1">
+                    {t(lang, 'مجلد الأرشفة التنفيذية', 'Cloud Storage Folder Path')}
+                  </label>
+                  <input
+                    type="text"
+                    value={autoConfig.monthlyFolderPrefix}
+                    onChange={(e) => setAutoConfig({ ...autoConfig, monthlyFolderPrefix: e.target.value })}
+                    className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-mono-num"
+                    dir="ltr"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 dark:text-slate-300 mb-1">
+                    {t(lang, 'يوم التنفيذ شهرياً (1–28)', 'Day of Month (1–28)')}
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={28}
+                    value={autoConfig.monthlyDayOfMonth}
+                    onChange={(e) =>
+                      setAutoConfig({ ...autoConfig, monthlyDayOfMonth: Number(e.target.value) || 1 })
+                    }
+                    className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-mono-num"
+                    dir="ltr"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 dark:text-slate-300 mb-1">
+                    {t(lang, 'ساعة التشغيل (Africa/Cairo)', 'Run Hour (Cairo)')}
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={23}
+                    value={autoConfig.monthlyHour}
+                    onChange={(e) => setAutoConfig({ ...autoConfig, monthlyHour: Number(e.target.value) || 6 })}
+                    className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-mono-num"
+                    dir="ltr"
+                  />
+                </div>
+                <div className="flex items-end justify-between gap-2">
+                  <label className="flex items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-200 pb-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={autoConfig.monthlyPdfEnabled}
+                      onChange={(e) => setAutoConfig({ ...autoConfig, monthlyPdfEnabled: e.target.checked })}
+                      className="rounded border-slate-300 text-teal-700 focus:ring-teal-600"
+                    />
+                    {t(lang, 'تفعيل شهري', 'Monthly Active')}
+                  </label>
+                  <button
+                    type="submit"
+                    disabled={autoSaving}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-xs font-semibold text-slate-800 dark:text-slate-100 cursor-pointer"
+                  >
+                    <Save className="w-3.5 h-3.5" />
+                    {t(lang, 'حفظ', 'Save')}
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+
+          {/* CARD 2: SCHEDULE WEEKLY DIGEST TOGGLE & EMAILABLE EXECUTIVE BUNDLE */}
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 space-y-4">
+            <div className="flex flex-wrap items-start justify-between gap-4">
+              <div>
+                <h2 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                  <Mail className="w-4 h-4 text-teal-700 dark:text-teal-400" />
+                  {t(
+                    lang,
+                    'الملخص التنفيذي الأسبوعي القابل للإرسال بالبريد (Schedule Weekly Digest)',
+                    'Schedule Weekly Digest — Emailable KPI & Risk Status Bundle'
+                  )}
+                </h2>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                  {t(
+                    lang,
+                    'يجمع مؤشرات الأداء الرئيسية KPI لهذا الأسبوع وتحديثات سجل المخاطر في رسالة بريد إلكتروني (.eml + HTML) مرفق بها ملف PDF المولد آلياً.',
+                    'Automatically bundles current week KPI metrics and Risk Register status updates into an emailable .eml package with the shared Financial Performance Summary PDF attached.'
+                  )}
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3">
+                {autoConfig && (
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={autoConfig.weeklyDigestEnabled}
+                    onClick={handleToggleWeeklyDigest}
+                    disabled={autoSaving}
+                    className={`inline-flex items-center gap-2.5 px-3.5 py-2 rounded-lg border text-xs font-bold transition-colors cursor-pointer ${
+                      autoConfig.weeklyDigestEnabled
+                        ? 'bg-teal-50 dark:bg-teal-950/50 border-teal-600 text-teal-900 dark:text-teal-200'
+                        : 'bg-slate-50 dark:bg-slate-800 border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-300'
+                    }`}
+                  >
+                    <span
+                      className={`w-8 h-4.5 rounded-full relative transition-colors inline-flex items-center px-0.5 ${
+                        autoConfig.weeklyDigestEnabled ? 'bg-teal-700' : 'bg-slate-400'
+                      }`}
+                    >
+                      <span
+                        className={`w-3.5 h-3.5 rounded-full bg-white transition-transform ${
+                          autoConfig.weeklyDigestEnabled ? 'translate-x-3.5' : 'translate-x-0'
+                        }`}
+                      />
+                    </span>
+                    <span>
+                      {t(lang, 'جدولة الملخص الأسبوعي (Schedule Weekly Digest)', 'Schedule Weekly Digest')}
+                    </span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={handleRunWeeklyDigestNow}
+                  disabled={weeklyDigestRunning}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-900 dark:bg-teal-700 hover:bg-slate-800 dark:hover:bg-teal-800 disabled:opacity-60 text-white text-xs font-semibold cursor-pointer transition-colors"
+                >
+                  {weeklyDigestRunning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+                  <span>
+                    {weeklyDigestRunning
+                      ? t(lang, 'جاري تجميع الحزمة...', 'Bundling Digest...')
+                      : t(lang, 'توليد حزمة البريد الأسبوعي الآن', 'Generate Weekly Digest Bundle Now')}
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            {autoConfig && (
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void persistAutomationPatch(
+                    {
+                      weeklyRecipientEmail: autoConfig.weeklyRecipientEmail,
+                      weeklyCcEmails: autoConfig.weeklyCcEmails,
+                      weeklyDayOfWeek: autoConfig.weeklyDayOfWeek,
+                      weeklyHour: autoConfig.weeklyHour,
+                      weeklyIncludePdf: autoConfig.weeklyIncludePdf,
+                    },
+                    t(lang, 'تم حفظ إعدادات تسليم الملخص الأسبوعي.', 'Weekly Digest delivery preferences saved.')
+                  );
+                }}
+                className="grid grid-cols-1 md:grid-cols-5 gap-3 pt-3 border-t border-slate-100 dark:border-slate-800"
+              >
+                <div className="md:col-span-2">
+                  <label className="block text-[11px] font-semibold text-slate-600 dark:text-slate-300 mb-1">
+                    {t(lang, 'البريد المستلم التنفيذي (To)', 'Executive Recipient Email (To)')}
+                  </label>
+                  <input
+                    type="email"
+                    value={autoConfig.weeklyRecipientEmail}
+                    onChange={(e) => setAutoConfig({ ...autoConfig, weeklyRecipientEmail: e.target.value })}
+                    className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-mono-num"
+                    dir="ltr"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 dark:text-slate-300 mb-1">
+                    {t(lang, 'يوم الإرسال الأسبوعي', 'Weekly Day')}
+                  </label>
+                  <select
+                    value={autoConfig.weeklyDayOfWeek}
+                    onChange={(e) => setAutoConfig({ ...autoConfig, weeklyDayOfWeek: Number(e.target.value) })}
+                    className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs"
+                  >
+                    <option value={0}>{t(lang, 'الأحد (Sunday)', 'Sunday')}</option>
+                    <option value={1}>{t(lang, 'الإثنين (Monday)', 'Monday')}</option>
+                    <option value={2}>{t(lang, 'الثلاثاء (Tuesday)', 'Tuesday')}</option>
+                    <option value={3}>{t(lang, 'الأربعاء (Wednesday)', 'Wednesday')}</option>
+                    <option value={4}>{t(lang, 'الخميس (Thursday)', 'Thursday')}</option>
+                    <option value={5}>{t(lang, 'الجمعة (Friday)', 'Friday')}</option>
+                    <option value={6}>{t(lang, 'السبت (Saturday)', 'Saturday')}</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 dark:text-slate-300 mb-1">
+                    {t(lang, 'الساعة (Africa/Cairo)', 'Hour (Cairo)')}
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={23}
+                    value={autoConfig.weeklyHour}
+                    onChange={(e) => setAutoConfig({ ...autoConfig, weeklyHour: Number(e.target.value) || 8 })}
+                    className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-mono-num"
+                    dir="ltr"
+                  />
+                </div>
+                <div className="flex items-end justify-between gap-2">
+                  <label className="flex items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-200 pb-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={autoConfig.weeklyIncludePdf}
+                      onChange={(e) => setAutoConfig({ ...autoConfig, weeklyIncludePdf: e.target.checked })}
+                      className="rounded border-slate-300 text-teal-700 focus:ring-teal-600"
+                    />
+                    {t(lang, 'إرفاق PDF', 'Attach PDF')}
+                  </label>
+                  <button
+                    type="submit"
+                    disabled={autoSaving}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-xs font-semibold text-slate-800 dark:text-slate-100 cursor-pointer"
+                  >
+                    <Save className="w-3.5 h-3.5" />
+                    {t(lang, 'حفظ', 'Save')}
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {/* Live Emailable Weekly Digest Preview */}
+            {(() => {
+              const digestRuns = autoRuns.filter((r) => r.runType === 'weekly_digest');
+              const activeDigest = digestRuns.find((r) => r.id === previewDigestId) || digestRuns[0];
+              if (!activeDigest || !activeDigest.emailHtmlPreview) return null;
+              return (
+                <div className="mt-2 border border-slate-200 dark:border-slate-700 rounded-xl overflow-hidden">
+                  <div className="px-4 py-2.5 bg-slate-50 dark:bg-slate-800/70 border-b border-slate-200 dark:border-slate-700 flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-xs">
+                      <span className="font-bold text-slate-900 dark:text-slate-100">
+                        {t(lang, 'معاينة رسالة البريد التنفيذي:', 'Emailable Digest Preview:')}
+                      </span>{' '}
+                      <span className="font-mono-num text-slate-600 dark:text-slate-300" dir="ltr">
+                        {activeDigest.emailSubject}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => handleDownloadAutomationAsset(activeDigest.id, 'eml')}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-[11px] font-semibold cursor-pointer"
+                      >
+                        <Mail className="w-3 h-3" />
+                        <span>{t(lang, 'تحميل رسالة البريد (.eml + PDF)', 'Download Email (.eml + PDF)')}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDownloadAutomationAsset(activeDigest.id, 'pdf')}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border border-slate-200 dark:border-slate-600 bg-white dark:bg-slate-800 hover:bg-slate-100 text-slate-800 dark:text-slate-100 text-[11px] font-semibold cursor-pointer"
+                      >
+                        <Download className="w-3 h-3" />
+                        <span>{t(lang, 'تحميل PDF المرفق', 'Download Attached PDF')}</span>
+                      </button>
+                    </div>
+                  </div>
+                  <iframe
+                    title="Weekly Digest Email Preview"
+                    sandbox=""
+                    srcDoc={activeDigest.emailHtmlPreview}
+                    className="w-full h-[380px] bg-slate-50 border-0"
+                  />
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* ARCHIVAL & DIGEST RUN HISTORY TABLE */}
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+            <div className="px-5 py-3.5 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
+              <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                <HardDrive className="w-4 h-4 text-teal-700 dark:text-teal-400" />
+                {t(lang, 'سجل التقارير الشهرية المؤرشفة وحزم الملخص الأسبوعي', 'Archived Monthly PDFs & Weekly Digest History')}
+              </h3>
+              <span className="text-xs text-slate-500 font-mono-num" dir="ltr">
+                {autoRuns.length} runs
+              </span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="bg-slate-50 dark:bg-slate-800/60 border-b border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300">
+                    <th className="py-2.5 px-4 text-start font-semibold">{t(lang, 'النوع والفترة', 'Type & Period')}</th>
+                    <th className="py-2.5 px-4 text-start font-semibold">{t(lang, 'المشغل / المستلم', 'Trigger / Recipient')}</th>
+                    <th className="py-2.5 px-4 text-start font-semibold">{t(lang, 'مسار التخزين السحابي', 'Cloud Storage URI')}</th>
+                    <th className="py-2.5 px-4 text-start font-semibold">{t(lang, 'الحجم / البصمة', 'Size / SHA-256')}</th>
+                    <th className="py-2.5 px-4 text-start font-semibold">{t(lang, 'الحالة', 'Status')}</th>
+                    <th className="py-2.5 px-4 text-end font-semibold">{t(lang, 'تحميل', 'Download')}</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                  {autoRuns.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="py-8 text-center text-slate-500">
+                        {autoLoading
+                          ? t(lang, 'جاري تحميل سجل الأرشفة...', 'Loading executive archive history...')
+                          : t(
+                              lang,
+                              'لا توجد تقارير مؤرشفة بعد — اضغط "توليد وأرشفة PDF الشهري الآن" أو "توليد حزمة البريد الأسبوعي الآن".',
+                              'No archived runs yet — click "Run Monthly PDF Archive Now" or "Generate Weekly Digest Bundle Now".'
+                            )}
+                      </td>
+                    </tr>
+                  ) : (
+                    autoRuns.map((run) => (
+                      <tr key={run.id} className="hover:bg-slate-50 dark:hover:bg-slate-800/40">
+                        <td className="py-2.5 px-4">
+                          <div className="font-bold text-slate-900 dark:text-slate-100 flex items-center gap-1.5">
+                            <span
+                              className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                                run.runType === 'monthly_pdf'
+                                  ? 'bg-teal-50 text-teal-800 border border-teal-200'
+                                  : 'bg-slate-100 text-slate-800 border border-slate-300'
+                              }`}
+                            >
+                              {run.runType === 'monthly_pdf' ? 'Monthly PDF' : 'Weekly Digest'}
+                            </span>
+                            <span className="font-mono-num" dir="ltr">{run.periodKey}</span>
+                          </div>
+                          <div className="font-mono-num text-[11px] text-slate-500 mt-0.5" dir="ltr">
+                            {run.id} · {run.createdAt.slice(0, 16).replace('T', ' ')} UTC
+                          </div>
+                        </td>
+                        <td className="py-2.5 px-4">
+                          <div className="font-medium text-slate-800 dark:text-slate-200">{run.triggerType}</div>
+                          <div className="text-[11px] text-slate-500 font-mono-num" dir="ltr">
+                            {run.recipientEmail || run.triggeredBy}
+                          </div>
+                        </td>
+                        <td className="py-2.5 px-4 max-w-[260px]">
+                          <div className="font-mono-num text-[11px] text-slate-700 dark:text-slate-300 truncate" dir="ltr" title={run.gcsUri}>
+                            {run.gcsUri}
+                          </div>
+                          {run.riskSnapshot && (
+                            <div className="text-[11px] text-slate-500 font-mono-num" dir="ltr">
+                              Risks: {run.riskSnapshot.total ?? 0} ({run.riskSnapshot.highUnmitigated ?? 0} High)
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-2.5 px-4 font-mono-num" dir="ltr">
+                          <div className="text-slate-900 dark:text-slate-100 font-semibold">
+                            {(run.fileSizeBytes / 1024).toFixed(1)} KB
+                          </div>
+                          <div className="text-[11px] text-slate-500">{run.checksumSha256.slice(0, 12)}…</div>
+                        </td>
+                        <td className="py-2.5 px-4">
+                          {run.storageMode === 'gcs' ? (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-emerald-200 bg-emerald-50 text-emerald-800 text-[11px] font-semibold">
+                              <CheckCircle2 className="w-3 h-3" />
+                              {t(lang, 'مؤرشف في GCS', 'Archived in GCS')}
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded border border-amber-200 bg-amber-50 text-amber-800 text-[11px] font-semibold" title={run.errorMessage || undefined}>
+                              <HardDrive className="w-3 h-3" />
+                              {t(lang, 'أرشيف محلي (GCS معلق)', 'Local Archive (GCS Pending)')}
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2.5 px-4 text-end">
+                          <div className="inline-flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => handleDownloadAutomationAsset(run.id, 'pdf')}
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-50 text-[11px] font-semibold text-slate-700 dark:text-slate-200 cursor-pointer"
+                            >
+                              <Download className="w-3 h-3" />
+                              .pdf
+                            </button>
+                            {run.runType === 'weekly_digest' && (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => handleDownloadAutomationAsset(run.id, 'eml')}
+                                  className="inline-flex items-center gap-1 px-2 py-1 rounded border border-teal-200 bg-teal-50 hover:bg-teal-100 text-[11px] font-semibold text-teal-800 cursor-pointer"
+                                >
+                                  <Mail className="w-3 h-3" />
+                                  .eml
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setPreviewDigestId(run.id)}
+                                  className="px-2 py-1 rounded border border-slate-200 text-[11px] font-medium text-slate-600 hover:bg-slate-50 cursor-pointer"
+                                >
+                                  {t(lang, 'معاينة', 'Preview')}
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* TAB 2: FULL POSTGRESQL JSON/CSV EXPORT, EXCEL WORKBOOK & ETL UPLOADER */}
       {subTab === 'excel' && (
         <div className="space-y-6">
@@ -1049,6 +1753,9 @@ export const DataQualityExportModule: React.FC<DataQualityExportModuleProps> = (
               <div>GET  /api/erp/integrations/eta/:id   — Egypt ETA e-Invoice v1.0 JSON</div>
               <div>POST /api/erp/backups/run            — Daily Cloud Storage snapshot export</div>
               <div>GET  /api/erp/backups/status         — Snapshot history & GCS DR config</div>
+              <div>GET  /api/erp/automation/status      — Monthly PDF & Weekly Digest schedules</div>
+              <div>POST /api/erp/automation/monthly-pdf/run  — Archive Financial Summary PDF to GCS</div>
+              <div>POST /api/erp/automation/weekly-digest/run — Bundle Weekly KPI + Risk EML/PDF</div>
               <div>GET  /api/erp/export/full-database   — All 16 PostgreSQL tables (json-zip/zip/json/csv)</div>
             </div>
           </div>
